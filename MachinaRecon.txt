@@ -1,265 +1,114 @@
 --!nocheck
 -- ============================================================
--- MACHINA RECON v3 — MINE PROTOCOL DECODER
--- Delta-compatible. Saves to: Delta/Workspace/MachinaRecon.txt
+-- MACHINA RECON v4 — MINIMAL OVERHEAD
+-- Branch: claude/rare-indicator-auto-aim-mC8LF
+-- File:   MachinaRecon.txt   (your loadstring URL stays the same)
 --
--- WHAT WE LEARNED FROM v2:
---   - All traffic goes through ReplicatedStorage.RemoteEvent
---   - Signature: FireServer(<4-byte nonce>, <command>, <args...>)
---   - Mine call: command="DamageBlockSmooth", args=<buffer>
---   - Auto toggle: command="SetAutoMine", args=true/false
---   - Magic nonce "\xFF\xFF\xFF\xFF" used for fire-and-forget cmds
---
--- WHAT v3 DOES:
---   1. Dumps every FireServer with FULL buffer contents in HEX
---      so we can see the DamageBlockSmooth payload format.
---   2. Adds buttons to TEST server-side commands directly:
---      - "Try AutoMine ON"   → fires SetAutoMine | true (one shot)
---      - "Spam AutoMine ON"  → re-asserts true every 0.3s
---      - "AutoMine OFF"      → fires SetAutoMine | false
---      - "Force SetMode Mine"
---   3. Skips the decompile dumps (Delta can't decompile this game).
---
--- HOW TO USE (same flow as before):
---   1. Execute. UI appears immediately.
---   2. Tap "Try AutoMine ON" → does the game start auto-mining?
---      If YES → we have a one-line cheat. If NO → server needs more.
---   3. Mine a block manually so we capture DamageBlockSmooth buffers.
---   4. Tap "SAVE" → upload MachinaRecon.txt back here.
+-- FIXES FROM v3:
+--   - Hook does ZERO serialization by default (just counts).
+--     The expensive hex-dump only happens when you tap "Capture Next 5",
+--     and stops automatically after 5 calls. So your game's Auto button
+--     keeps working normally.
+--   - Log shows INSIDE THE GUI (scrolling textbox) so you can read it
+--     even if writefile is broken on your phone.
+--   - "Test Write" button proves whether file save works at all,
+--     with visible error if it doesn't.
+--   - "Disable Hook" button — lets you confirm the hook isn't the cause.
 -- ============================================================
 
-print("[Recon v3] loading...")
+print("[Recon v4] loading")
 
 local Players          = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage= game:GetService("ReplicatedStorage")
-
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
 
--- ============================================================
--- CONFIG
--- ============================================================
-local OUT_FILE   = "MachinaRecon.txt"
-local BUF_BYTES  = 256       -- how many bytes of each buffer to log
-local MAX_FIRES  = 600       -- hard cap so file doesn't grow forever
+local OUT_FILE    = "MachinaRecon.txt"
 local MAGIC_NONCE = string.char(255,255,255,255)
 
 -- ============================================================
--- FS
+-- ENV PROBE — find writefile via multiple paths
 -- ============================================================
-local function g(n)
-	local ok, v = pcall(function() return getfenv()[n] end)
-	if ok and v then return v end
-	return rawget(_G, n)
+local function find(n)
+	local v = rawget(_G, n); if v then return v end
+	local ok, env = pcall(getfenv, 0); if ok and env then v = env[n]; if v then return v end end
+	local ok2, gg = pcall(getgenv); if ok2 and gg then v = gg[n]; if v then return v end end
+	return nil
 end
-local _writefile  = g("writefile")
-local _appendfile = g("appendfile")
-local _readfile   = g("readfile")
-local _isfile     = g("isfile")
-
-local _buf, _saving = {}, false
-local function flush()
-	if _saving or #_buf == 0 or not _writefile then return end
-	_saving = true
-	local chunk = table.concat(_buf, "\n") .. "\n"
-	_buf = {}
-	pcall(function()
-		if _appendfile and _isfile and _isfile(OUT_FILE) then
-			_appendfile(OUT_FILE, chunk)
-		else
-			local prev = ""
-			if _readfile and _isfile and _isfile(OUT_FILE) then
-				prev = _readfile(OUT_FILE) or ""
-			end
-			_writefile(OUT_FILE, prev .. chunk)
-		end
-	end)
-	_saving = false
-end
-
-local function log(line)
-	table.insert(_buf, tostring(line))
-	if #_buf >= 20 then flush() end
-end
-
-if _writefile then pcall(_writefile, OUT_FILE, "") end
-task.spawn(function() while true do task.wait(1.5); flush() end end)
+local _writefile  = find("writefile")
+local _readfile   = find("readfile")
+local _appendfile = find("appendfile")
+local _isfile     = find("isfile")
 
 -- ============================================================
--- HEX HELPERS
+-- IN-MEMORY LOG  (we always have this even if file save fails)
 -- ============================================================
-local function bytesToHex(s, max)
-	max = max or #s
+local LOG_LINES = {}
+local LOG_MAX = 400
+local function log(s)
+	s = tostring(s)
+	table.insert(LOG_LINES, s)
+	if #LOG_LINES > LOG_MAX then table.remove(LOG_LINES, 1) end
+	print("[R4] " .. s)
+end
+
+local function logHeader()
+	log(("===== RECON v4  %s ====="):format(os.date("%H:%M:%S")))
+	log(("writefile=%s readfile=%s appendfile=%s"):format(
+		tostring(_writefile~=nil), tostring(_readfile~=nil), tostring(_appendfile~=nil)))
+	log(("Player: %s  PlaceId: %d"):format(LocalPlayer.Name, game.PlaceId))
+end
+
+-- ============================================================
+-- BYTE HELPERS
+-- ============================================================
+local function strHex(s, max)
+	max = max or 64
 	local n = math.min(#s, max)
 	local out = {}
-	for i = 1, n do
-		out[i] = string.format("%02x", string.byte(s, i))
-	end
+	for i = 1, n do out[i] = string.format("%02x", string.byte(s, i)) end
 	local hex = table.concat(out, " ")
-	if #s > n then hex = hex .. " ... (+" .. (#s - n) .. " more)" end
+	if #s > n then hex = hex .. (" ...+%d"):format(#s - n) end
 	return hex
 end
-
-local function bufferToHex(b, max)
-	-- Roblox 'buffer' type. Try buffer.tostring first.
+local function bufHex(b, max)
+	max = max or 96
 	local ok, raw = pcall(buffer.tostring, b)
-	if ok and type(raw) == "string" then
-		return bytesToHex(raw, max), #raw
-	end
-	-- Fallback: byte-by-byte
-	local len = 0
-	pcall(function() len = buffer.len(b) end)
-	if len == 0 then return "<unreadable buffer>", 0 end
-	local n = math.min(len, max)
-	local out = {}
-	for i = 0, n - 1 do
-		local ok2, byte = pcall(buffer.readu8, b, i)
-		out[i+1] = string.format("%02x", ok2 and byte or 0)
-	end
-	local hex = table.concat(out, " ")
-	if len > n then hex = hex .. " ... (+" .. (len - n) .. " more)" end
-	return hex, len
+	if ok and type(raw) == "string" then return strHex(raw, max), #raw end
+	return "<unreadable>", 0
 end
 
--- ============================================================
--- SERIALIZER (now with buffer hex)
--- ============================================================
-local function ser(v, d)
-	d = d or 0; if d > 3 then return "<deep>" end
+-- Serialize ONE arg compactly. No deep tables, no work for instances.
+local function sarg(v)
 	local t = typeof(v)
-	if t == "Instance" then
-		local cls, fn = "?", "?"
-		pcall(function() cls = v.ClassName end)
-		pcall(function() fn = v:GetFullName() end)
-		return ("<%s:%s>"):format(cls, fn)
-	elseif t == "Vector3" then return ("V3(%.1f,%.1f,%.1f)"):format(v.X, v.Y, v.Z)
-	elseif t == "CFrame" then local p = v.Position; return ("CF(%.1f,%.1f,%.1f)"):format(p.X, p.Y, p.Z)
+	if t == "string" then
+		local p = v:gsub("[%c\128-\255]", ".")
+		return ("\"%s\"(hex=%s)"):format(p, strHex(v, 8))
 	elseif t == "buffer" then
-		local hex, len = bufferToHex(v, BUF_BYTES)
-		return ("<buffer len=%d hex=[%s]>"):format(len, hex)
-	elseif t == "EnumItem" then return tostring(v)
-	elseif t == "string" then
-		-- Show printable, plus hex
-		local printable = v:gsub("[%c\128-\255]", ".")
-		return ("\"%s\"(hex=%s,len=%d)"):format(printable, bytesToHex(v, 16), #v)
-	elseif t == "number" or t == "boolean" or t == "nil" then return tostring(v)
-	elseif t == "table" then
-		local p, n = {}, 0
-		for k, vv in pairs(v) do
-			n = n + 1; if n > 12 then table.insert(p, "...") break end
-			table.insert(p, ("[%s]=%s"):format(ser(k, d+1), ser(vv, d+1)))
-		end
-		return "{" .. table.concat(p, ", ") .. "}"
-	end
-	return ("<%s>"):format(t)
-end
-local function serArgs(...)
-	local n, p = select("#", ...), {}
-	for i = 1, n do p[i] = ser((select(i, ...))) end
-	return table.concat(p, " | ")
+		local hex, n = bufHex(v); return ("<buf len=%d %s>"):format(n, hex)
+	elseif t == "Instance" then
+		local fn = ""; pcall(function() fn = v:GetFullName() end); return "<"..t..":"..fn..">"
+	elseif t == "Vector3" then return ("V3(%.0f,%.0f,%.0f)"):format(v.X,v.Y,v.Z)
+	elseif t == "boolean" or t == "number" or t == "nil" then return tostring(v)
+	elseif t == "table" then return "<table>"  -- skip; too risky for perf
+	else return "<"..t..">" end
 end
 
 -- ============================================================
--- HEADER + REMOTE LIST
+-- COUNTERS
 -- ============================================================
-log(("===== MACHINA RECON v3  %s ====="):format(os.date("%Y-%m-%d %H:%M:%S")))
-log(("PlaceId: %d   JobId: %s   Player: %s"):format(game.PlaceId, game.JobId or "", LocalPlayer.Name))
-log("")
-log("----- ReplicatedStorage remotes -----")
-for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
-	if d:IsA("RemoteEvent") or d:IsA("RemoteFunction")
-		or d:IsA("BindableEvent") or d:IsA("BindableFunction")
-		or d:IsA("UnreliableRemoteEvent") then
-		log(("[%s] %s"):format(d.ClassName, d:GetFullName()))
-	end
-end
-log("")
-flush()
-
--- ============================================================
--- UI
--- ============================================================
-print("[Recon v3] building UI...")
-
-local C = {
-	BG=Color3.fromRGB(14,19,33), DEEP=Color3.fromRGB(5,8,16),
-	CARD=Color3.fromRGB(22,30,50), TXT=Color3.fromRGB(240,245,255),
-	DIM=Color3.fromRGB(135,155,185), PINK=Color3.fromRGB(245,90,165),
-	OK=Color3.fromRGB(80,195,130), WARN=Color3.fromRGB(235,175,75),
-	BLUE=Color3.fromRGB(80,150,235), PURPLE=Color3.fromRGB(120,80,200),
-	RED=Color3.fromRGB(225,85,95),
+local stats = {
+	totalFires = 0,
+	captureRemaining = 0,
+	hookEnabled = true,
+	markCount = 0,
+	cmds = {},  -- [commandName] = count
 }
-local function corner(o,r) local c=Instance.new("UICorner") c.CornerRadius=UDim.new(0,r or 6) c.Parent=o end
-local function stroke(o,col,t) local s=Instance.new("UIStroke") s.Color=col s.Thickness=t or 1 s.Parent=o end
-
-local old = PlayerGui:FindFirstChild("MachinaReconV3")
-if old then old:Destroy() end
-
-local gui = Instance.new("ScreenGui")
-gui.Name = "MachinaReconV3"
-gui.ResetOnSpawn = false
-gui.IgnoreGuiInset = true
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-gui.DisplayOrder = 999
-gui.Parent = PlayerGui
-
-local root = Instance.new("Frame")
-root.Size = UDim2.new(0, 250, 0, 410)
-root.Position = UDim2.new(0, 16, 0.5, -205)
-root.BackgroundColor3 = C.BG
-root.BorderSizePixel = 0
-root.Active = true
-root.ZIndex = 1000
-root.Parent = gui
-corner(root, 10); stroke(root, C.DEEP, 1)
-
-local titleBar = Instance.new("Frame")
-titleBar.Size = UDim2.new(1,0,0,30)
-titleBar.BackgroundColor3 = C.DEEP
-titleBar.BorderSizePixel = 0
-titleBar.ZIndex = 1001
-titleBar.Parent = root
-corner(titleBar,10)
-local fix = Instance.new("Frame")
-fix.Size=UDim2.new(1,0,0,12); fix.Position=UDim2.new(0,0,1,-12)
-fix.BackgroundColor3=C.DEEP; fix.BorderSizePixel=0; fix.ZIndex=1001; fix.Parent=titleBar
-
-local stripe = Instance.new("Frame")
-stripe.Size=UDim2.new(0,3,1,-10); stripe.Position=UDim2.new(0,8,0,5)
-stripe.BackgroundColor3=C.PINK; stripe.BorderSizePixel=0
-stripe.ZIndex=1002; stripe.Parent=titleBar; corner(stripe,2)
-
-local titleLbl = Instance.new("TextLabel")
-titleLbl.Size=UDim2.new(1,-20,1,0); titleLbl.Position=UDim2.new(0,18,0,0)
-titleLbl.BackgroundTransparency=1; titleLbl.Text="RECON v3 — MINE DECODER"
-titleLbl.Font=Enum.Font.GothamBlack; titleLbl.TextSize=11
-titleLbl.TextColor3=C.TXT; titleLbl.TextXAlignment=Enum.TextXAlignment.Left
-titleLbl.ZIndex=1002; titleLbl.Parent=titleBar
-
-local status = Instance.new("TextLabel")
-status.Size=UDim2.new(1,-16,0,28)
-status.Position=UDim2.new(0,8,0,36)
-status.BackgroundColor3=C.CARD; status.BorderSizePixel=0
-status.Font=Enum.Font.Code; status.TextSize=10
-status.TextColor3=C.OK; status.Text="  initializing..."
-status.TextXAlignment=Enum.TextXAlignment.Left
-status.TextWrapped=true; status.ZIndex=1001; status.Parent=root
-corner(status,6)
-local pad = Instance.new("UIPadding")
-pad.PaddingTop=UDim.new(0,4); pad.PaddingLeft=UDim.new(0,6); pad.Parent=status
 
 -- ============================================================
--- HOOK
+-- HOOK — minimal work by default
 -- ============================================================
-local fireCount = 0
-local mineBufferCount = 0
-local markCount = 0
-
-local R = ReplicatedStorage:WaitForChild("RemoteEvent")
-log("[Recon v3] Found RemoteEvent: " .. R:GetFullName())
-flush()
-
 pcall(function()
 	local mt = getrawmetatable(game)
 	local setRO = setreadonly or make_writeable
@@ -268,187 +117,250 @@ pcall(function()
 	if isRO(mt) then pcall(setRO, mt, false) end
 	local oldNC = mt.__namecall
 	mt.__namecall = newcc(function(self, ...)
-		local method = getnamecallmethod and getnamecallmethod() or ""
-		if (method == "FireServer" or method == "InvokeServer") and fireCount < MAX_FIRES then
-			fireCount = fireCount + 1
-			local argsStr = serArgs(...)
-			-- Track mine count specifically
-			local args = {...}
-			if args[2] == "DamageBlockSmooth" then
-				mineBufferCount = mineBufferCount + 1
+		if stats.hookEnabled then
+			local method = getnamecallmethod and getnamecallmethod() or ""
+			if method == "FireServer" or method == "InvokeServer" then
+				stats.totalFires = stats.totalFires + 1
+				local args = {...}
+				local cmd = type(args[2]) == "string" and args[2] or "?"
+				stats.cmds[cmd] = (stats.cmds[cmd] or 0) + 1
+				if stats.captureRemaining > 0 then
+					stats.captureRemaining = stats.captureRemaining - 1
+					-- ONLY here do we do heavy serialization
+					local parts = {}
+					for i = 1, select("#", ...) do parts[i] = sarg((select(i, ...))) end
+					log(("[CAP %d] cmd=%s args=%s"):format(
+						stats.totalFires, cmd, table.concat(parts, " | ")))
+				end
 			end
-			local path = "?"
-			pcall(function() path = self:GetFullName() end)
-			pcall(log, ("[FIRE #%d] %s :%s(%s)"):format(
-				fireCount, path, method, argsStr))
 		end
 		return oldNC(self, ...)
 	end)
 	pcall(setRO, mt, true)
 end)
-
-log("[Recon v3] Hook installed.")
-flush()
+logHeader()
+log("hook installed (idle — taps Capture to log args)")
 
 -- ============================================================
--- BUTTON BUILDERS
+-- UI
 -- ============================================================
-local function makeBtn(layoutY, label, color, onClick)
+local C = {
+	BG=Color3.fromRGB(14,19,33), DEEP=Color3.fromRGB(5,8,16),
+	CARD=Color3.fromRGB(22,30,50), TXT=Color3.fromRGB(240,245,255),
+	DIM=Color3.fromRGB(135,155,185), PINK=Color3.fromRGB(245,90,165),
+	OK=Color3.fromRGB(80,195,130), WARN=Color3.fromRGB(235,175,75),
+	BLUE=Color3.fromRGB(80,150,235), RED=Color3.fromRGB(225,85,95),
+	PURPLE=Color3.fromRGB(120,80,200),
+}
+local function corner(o,r) local c=Instance.new("UICorner") c.CornerRadius=UDim.new(0,r or 6) c.Parent=o end
+local function stroke(o,col,t) local s=Instance.new("UIStroke") s.Color=col s.Thickness=t or 1 s.Parent=o end
+
+local old = PlayerGui:FindFirstChild("MachinaReconV4")
+if old then old:Destroy() end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "MachinaReconV4"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.DisplayOrder = 9999
+gui.Parent = PlayerGui
+
+local root = Instance.new("Frame")
+root.Size = UDim2.new(0, 280, 0, 520)
+root.Position = UDim2.new(0, 16, 0.5, -260)
+root.BackgroundColor3 = C.BG
+root.BorderSizePixel = 0
+root.Active = true
+root.ZIndex = 10000
+root.Parent = gui
+corner(root,10); stroke(root,C.DEEP,1)
+
+local function setZIndex(p, z)
+	if p:IsA("GuiObject") then p.ZIndex = z end
+	for _, c in ipairs(p:GetChildren()) do setZIndex(c, z) end
+end
+
+-- Title bar
+local titleBar = Instance.new("Frame")
+titleBar.Size=UDim2.new(1,0,0,30); titleBar.BackgroundColor3=C.DEEP
+titleBar.BorderSizePixel=0; titleBar.Parent=root; corner(titleBar,10)
+local fix=Instance.new("Frame"); fix.Size=UDim2.new(1,0,0,12)
+fix.Position=UDim2.new(0,0,1,-12); fix.BackgroundColor3=C.DEEP
+fix.BorderSizePixel=0; fix.Parent=titleBar
+local stripe=Instance.new("Frame"); stripe.Size=UDim2.new(0,3,1,-10)
+stripe.Position=UDim2.new(0,8,0,5); stripe.BackgroundColor3=C.PINK
+stripe.BorderSizePixel=0; stripe.Parent=titleBar; corner(stripe,2)
+local titleLbl=Instance.new("TextLabel"); titleLbl.Size=UDim2.new(1,-20,1,0)
+titleLbl.Position=UDim2.new(0,18,0,0); titleLbl.BackgroundTransparency=1
+titleLbl.Text="RECON v4"; titleLbl.Font=Enum.Font.GothamBlack
+titleLbl.TextSize=11; titleLbl.TextColor3=C.TXT
+titleLbl.TextXAlignment=Enum.TextXAlignment.Left; titleLbl.Parent=titleBar
+
+-- Status
+local status=Instance.new("TextLabel")
+status.Size=UDim2.new(1,-16,0,30); status.Position=UDim2.new(0,8,0,36)
+status.BackgroundColor3=C.CARD; status.BorderSizePixel=0
+status.Font=Enum.Font.Code; status.TextSize=10; status.TextColor3=C.OK
+status.Text="  ready"; status.TextXAlignment=Enum.TextXAlignment.Left
+status.TextWrapped=true; status.Parent=root; corner(status,6)
+local sp=Instance.new("UIPadding"); sp.PaddingTop=UDim.new(0,4)
+sp.PaddingLeft=UDim.new(0,6); sp.Parent=status
+
+-- BUTTONS
+local function btn(y, text, color, click)
 	local b = Instance.new("TextButton")
-	b.Size = UDim2.new(1, -16, 0, 30)
-	b.Position = UDim2.new(0, 8, 0, layoutY)
-	b.BackgroundColor3 = color
-	b.AutoButtonColor = false
-	b.Text = label
-	b.Font = Enum.Font.GothamBold
-	b.TextSize = 11
-	b.TextColor3 = C.TXT
-	b.ZIndex = 1001
-	b.Parent = root
-	corner(b, 6)
-	b.MouseButton1Click:Connect(onClick)
+	b.Size=UDim2.new(1,-16,0,28); b.Position=UDim2.new(0,8,0,y)
+	b.BackgroundColor3=color; b.AutoButtonColor=false
+	b.Text=text; b.Font=Enum.Font.GothamBold; b.TextSize=11
+	b.TextColor3=C.TXT; b.Parent=root; corner(b,6)
+	b.MouseButton1Click:Connect(click)
 	return b
 end
 
-local function makeMark(layoutY, label, tag, color)
-	return makeBtn(layoutY, label, color, function()
-		markCount = markCount + 1
-		log("")
-		log(("================ MARK #%d  [%s]  fires=%d  buffers=%d ================")
-			:format(markCount, tag, fireCount, mineBufferCount))
-		log("")
-		flush()
-	end)
-end
+local R = ReplicatedStorage:WaitForChild("RemoteEvent")
 
--- Markers (top section)
-makeMark( 70, "▸ MARK: MANUAL MINE", "MANUAL_MINE", C.BLUE)
-makeMark(104, "▸ MARK: AUTO BUTTON", "RELIC_AUTO",  C.PINK)
+local hookBtn
+local captureBtn
+local fileBtn
 
--- ============================================================
--- TEST BUTTONS — the actual cheats
--- ============================================================
-local spamOn = false
-
-local autoOnBtn = makeBtn(150, "★ Try AUTO MINE ON", C.OK, function()
-	log("")
-	log(("================ ME → FireServer SetAutoMine TRUE  fires=%d ================"):format(fireCount))
-	flush()
-	local ok, err = pcall(function()
-		R:FireServer(MAGIC_NONCE, "SetAutoMine", true)
-	end)
-	if not ok then
-		log("[Recon v3] FireServer error: " .. tostring(err))
-		flush()
-	end
+btn(74, "★ Try AUTO MINE ON", C.OK, function()
+	log("ME→ FireServer SetAutoMine TRUE")
+	local ok, err = pcall(function() R:FireServer(MAGIC_NONCE, "SetAutoMine", true) end)
+	if not ok then log("  ERR: "..tostring(err)) end
 end)
 
-local autoOffBtn = makeBtn(184, "■ Try AUTO MINE OFF", C.RED, function()
-	log("")
-	log(("================ ME → FireServer SetAutoMine FALSE  fires=%d ================"):format(fireCount))
-	flush()
+btn(106, "■ Try AUTO MINE OFF", C.RED, function()
+	log("ME→ FireServer SetAutoMine FALSE")
 	pcall(function() R:FireServer(MAGIC_NONCE, "SetAutoMine", false) end)
 end)
 
-local spamBtn = makeBtn(218, "✦ SPAM AUTO ON (3/s)", C.PURPLE, function() end)
-spamBtn.MouseButton1Click:Connect(function()
-	spamOn = not spamOn
-	spamBtn.Text = spamOn and "✦ SPAMMING... tap to stop" or "✦ SPAM AUTO ON (3/s)"
-	spamBtn.BackgroundColor3 = spamOn and C.WARN or C.PURPLE
-	if spamOn then
-		log("")
-		log(("================ ME → SPAM SetAutoMine TRUE starting  fires=%d ================"):format(fireCount))
-		flush()
+captureBtn = btn(138, "📸 Capture Next 5 fires", C.BLUE, function()
+	stats.captureRemaining = 5
+	log("CAPTURE armed for next 5 FireServer calls")
+end)
+
+hookBtn = btn(170, "Hook: ON (tap to disable)", C.WARN, function()
+	stats.hookEnabled = not stats.hookEnabled
+	hookBtn.Text = stats.hookEnabled and "Hook: ON (tap to disable)" or "Hook: OFF (game raw)"
+	hookBtn.BackgroundColor3 = stats.hookEnabled and C.WARN or C.CARD
+	log("hook " .. (stats.hookEnabled and "ENABLED" or "DISABLED"))
+end)
+
+fileBtn = btn(202, "💾 Test Write + Save Log", C.PURPLE, function()
+	if not _writefile then
+		log("ERR: writefile() does not exist in this exec env")
+		fileBtn.Text = "✗ no writefile"; return
 	end
-end)
-task.spawn(function()
-	while true do
-		task.wait(0.3)
-		if spamOn then
-			pcall(function() R:FireServer(MAGIC_NONCE, "SetAutoMine", true) end)
-		end
+	local payload = table.concat(LOG_LINES, "\n")
+	local ok, err = pcall(_writefile, OUT_FILE, payload)
+	if not ok then
+		log("ERR writefile: " .. tostring(err))
+		fileBtn.Text = "✗ write FAILED"; return
 	end
+	-- Read it back to verify
+	local back = nil
+	if _readfile then
+		local ok2, r = pcall(_readfile, OUT_FILE)
+		if ok2 then back = r end
+	end
+	if back == payload then
+		log(("✓ wrote %d bytes to %s, verified"):format(#payload, OUT_FILE))
+		fileBtn.Text = ("✓ saved %d bytes"):format(#payload)
+	elseif back then
+		log(("? wrote but readback differs (read %d bytes)"):format(#back))
+		fileBtn.Text = "? wrote but mismatch"
+	else
+		log(("? wrote but cannot read back"))
+		fileBtn.Text = "? wrote, no read"
+	end
+	task.delay(3, function() if fileBtn.Parent then fileBtn.Text = "💾 Test Write + Save Log" end end)
 end)
 
-local modeBtn = makeBtn(252, "⛏ Force SetMode = Mine", C.BLUE, function()
-	log("")
-	log(("================ ME → FireServer SetMode Mine  fires=%d ================"):format(fireCount))
-	flush()
-	pcall(function() R:FireServer(MAGIC_NONCE, "SetMode", "Mine") end)
+btn(234, "Mark MANUAL MINE", C.BLUE, function()
+	stats.markCount = stats.markCount + 1
+	log(("=== MARK #%d MANUAL_MINE fires=%d ==="):format(stats.markCount, stats.totalFires))
+end)
+btn(266, "Mark AUTO BUTTON", C.PINK, function()
+	stats.markCount = stats.markCount + 1
+	log(("=== MARK #%d AUTO_BTN fires=%d ==="):format(stats.markCount, stats.totalFires))
 end)
 
--- Save / Hide
-local saveBtn = makeBtn(296, "💾 SAVE FILE", C.OK, function()
-	flush()
-	saveBtn.Text = "SAVED ✓"
-	task.delay(1.5, function() if saveBtn.Parent then saveBtn.Text = "💾 SAVE FILE" end end)
-end)
+-- LOG VIEW (scrolling text)
+local logTitle = Instance.new("TextLabel")
+logTitle.Size=UDim2.new(1,-16,0,16); logTitle.Position=UDim2.new(0,8,0,302)
+logTitle.BackgroundTransparency=1; logTitle.Text="LIVE LOG"
+logTitle.Font=Enum.Font.GothamBold; logTitle.TextSize=10
+logTitle.TextColor3=C.DIM; logTitle.TextXAlignment=Enum.TextXAlignment.Left
+logTitle.Parent=root
 
-local hideBtn = makeBtn(330, "HIDE", C.CARD, function() end)
+local logFrame = Instance.new("ScrollingFrame")
+logFrame.Size=UDim2.new(1,-16,1,-330); logFrame.Position=UDim2.new(0,8,0,322)
+logFrame.BackgroundColor3=C.DEEP; logFrame.BorderSizePixel=0
+logFrame.ScrollBarThickness=4; logFrame.CanvasSize=UDim2.new(0,0,0,0)
+logFrame.AutomaticCanvasSize=Enum.AutomaticSize.Y
+logFrame.ScrollBarImageColor3=C.DIM; logFrame.Parent=root
+corner(logFrame,6)
 
-local hint = Instance.new("TextLabel")
-hint.Size=UDim2.new(1,-16,0,40); hint.Position=UDim2.new(0,8,0,366)
-hint.BackgroundTransparency=1
-hint.Text="Test order: Try AUTO ON → wait 3s →\nif nothing happens, try SPAM → SetMode Mine"
-hint.Font=Enum.Font.Code; hint.TextSize=9
-hint.TextColor3=C.DIM; hint.TextWrapped=true
-hint.TextXAlignment=Enum.TextXAlignment.Left
-hint.TextYAlignment=Enum.TextYAlignment.Top
-hint.ZIndex=1001; hint.Parent=root
+local logText = Instance.new("TextLabel")
+logText.Size=UDim2.new(1,-8,0,0); logText.Position=UDim2.new(0,4,0,4)
+logText.AutomaticSize=Enum.AutomaticSize.Y
+logText.BackgroundTransparency=1; logText.Font=Enum.Font.Code
+logText.TextSize=9; logText.TextColor3=C.TXT
+logText.TextXAlignment=Enum.TextXAlignment.Left
+logText.TextYAlignment=Enum.TextYAlignment.Top
+logText.TextWrapped=true; logText.Text=""; logText.Parent=logFrame
+
+setZIndex(root, 10000)
 
 -- Drag
 do
-	local dragging, ds, sp = false, nil, nil
+	local dragging, ds, sp_ = false, nil, nil
 	titleBar.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1
-			or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = true; ds = input.Position; sp = root.Position
+		if input.UserInputType==Enum.UserInputType.MouseButton1
+			or input.UserInputType==Enum.UserInputType.Touch then
+			dragging=true; ds=input.Position; sp_=root.Position
 			input.Changed:Connect(function()
-				if input.UserInputState == Enum.UserInputState.End then dragging = false end
+				if input.UserInputState==Enum.UserInputState.End then dragging=false end
 			end)
 		end
 	end)
 	UserInputService.InputChanged:Connect(function(input)
 		if not dragging then return end
-		if input.UserInputType ~= Enum.UserInputType.MouseMovement
-			and input.UserInputType ~= Enum.UserInputType.Touch then return end
+		if input.UserInputType~=Enum.UserInputType.MouseMovement
+			and input.UserInputType~=Enum.UserInputType.Touch then return end
 		local d = input.Position - ds
-		root.Position = UDim2.new(sp.X.Scale, sp.X.Offset + d.X,
-			sp.Y.Scale, sp.Y.Offset + d.Y)
+		root.Position = UDim2.new(sp_.X.Scale, sp_.X.Offset+d.X,
+			sp_.Y.Scale, sp_.Y.Offset+d.Y)
 	end)
 end
 
--- Bubble for hide
-local bubble = Instance.new("TextButton")
-bubble.Size=UDim2.new(0,50,0,50); bubble.Position=UDim2.new(0,16,0,16)
-bubble.BackgroundColor3=C.PINK; bubble.AutoButtonColor=false
-bubble.Text="R3"; bubble.Font=Enum.Font.GothamBlack
-bubble.TextSize=16; bubble.TextColor3=C.TXT
-bubble.Visible=false; bubble.ZIndex=1100; bubble.Parent=gui
-do
-	local c=Instance.new("UICorner") c.CornerRadius=UDim.new(1,0) c.Parent=bubble
-	local s=Instance.new("UIStroke") s.Color=C.TXT s.Thickness=2 s.Parent=bubble
-end
-hideBtn.MouseButton1Click:Connect(function()
-	root.Visible=false; bubble.Visible=true
-end)
-bubble.MouseButton1Click:Connect(function()
-	root.Visible=true; bubble.Visible=false
-end)
-
--- Live status
+-- Live updater
 task.spawn(function()
-	while true do
+	while gui.Parent do
 		task.wait(0.4)
 		if status.Parent then
-			status.Text = ("hook on · %d fires · %d mines · %d marks%s"):format(
-				fireCount, mineBufferCount, markCount,
-				spamOn and " · SPAM" or "")
+			local top3 = {}
+			local pairs_arr = {}
+			for k, v in pairs(stats.cmds) do table.insert(pairs_arr, {k, v}) end
+			table.sort(pairs_arr, function(a, b) return a[2] > b[2] end)
+			for i = 1, math.min(3, #pairs_arr) do
+				table.insert(top3, pairs_arr[i][1].."("..pairs_arr[i][2]..")")
+			end
+			status.Text = ("fires=%d cap=%d mark=%d  top: %s"):format(
+				stats.totalFires, stats.captureRemaining, stats.markCount,
+				table.concat(top3, " "))
+		end
+		if logText.Parent then
+			-- show last 30 lines
+			local start = math.max(1, #LOG_LINES - 30)
+			local arr = {}
+			for i = start, #LOG_LINES do arr[#arr+1] = LOG_LINES[i] end
+			logText.Text = table.concat(arr, "\n")
+			-- auto scroll to bottom
+			logFrame.CanvasPosition = Vector2.new(0, logText.AbsoluteSize.Y)
 		end
 	end
 end)
 
-print("[Recon v3] ready.")
-log("")
-log("=== READY — Use buttons to test, then SAVE ===")
-flush()
+print("[Recon v4] ready")
