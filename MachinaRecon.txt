@@ -1,24 +1,26 @@
 --!nocheck
 -- ============================================================
--- MACHINA RECON v8  —  RADIUS MINE (real formula)
+-- MACHINA RECON v9  —  RADIUS MINE  (speed tuning)
 -- Branch: claude/rare-indicator-auto-aim-mC8LF
 -- File:   MachinaRecon.txt
 --
--- DECODED FROM v7:
---   - Mineable parts live in workspace.CollisionParts (not Blocks)
---   - Block size = 6 studs, origin = (12000, 12000, 12000)
---   - DamageBlockSmooth buffer is 4 little-endian f64s in order:
---       buf[0] = (worldZ - 12000) / 6    ← NOTE: Z first, not X
---       buf[1] = (worldY - 12000) / 6
---       buf[2] = (worldX - 12000) / 6
---       buf[3] = damage  (~0.02 normal, untested at higher)
+-- WHAT v8 PROVED:
+--   - Formula is correct, radius mine breaks real blocks
+--   - But server-side range gating means far blocks silently fail
+--   - Effective rate was ~1 block/sec
 --
--- HOW TO USE:
---   1. Tap "🔨 Test 1 Block (nearest)" — should break the nearest
---      CollisionPart instantly with dmg=1.0. If yes, formula works.
---   2. Tap "RADIUS MINE: OFF" → flips to ON. Defaults: r=8, hz=10, dmg=1.
---   3. Tune via pills. Start small; rate-limit might trigger anti-cheat
---      if you push too hard.
+-- v9 SPEED IMPROVEMENTS:
+--   - "Hits/block" pill: fires each block N times per cycle (multiplier)
+--   - Targets sorted by distance: closest first (more likely to succeed
+--     server-side, since the server enforces your in-game mining range)
+--   - Live "mined/sec" counter via CollisionParts.ChildRemoved
+--   - Defaults bumped: hz=20, hits=3, dmg=1
+--
+-- TIPS:
+--   - Bump Damage to 5 or 100 to test if server clamps damage
+--   - Bump Hits/block to 10 for max throughput
+--   - True "radius" mining is capped by your Range upgrade. Buy more
+--     Range upgrades in-game to extend.
 -- ============================================================
 
 local Players          = game:GetService("Players")
@@ -32,9 +34,6 @@ local OUT_FILE    = "MachinaRecon.txt"
 local MAGIC_NONCE = string.char(255,255,255,255)
 local R = ReplicatedStorage:WaitForChild("RemoteEvent")
 
--- ============================================================
--- CONFIG (configurable in case other worlds differ)
--- ============================================================
 local ORIGIN     = Vector3.new(12000, 12000, 12000)
 local BLOCK_SIZE = 6
 
@@ -53,14 +52,14 @@ local _writefile = find("writefile")
 -- LOG
 -- ============================================================
 local LOG = {}
-local LOG_MAX = 250
+local LOG_MAX = 200
 local function log(s)
 	table.insert(LOG, tostring(s))
 	if #LOG > LOG_MAX then table.remove(LOG, 1) end
 end
 
 -- ============================================================
--- BUFFER BUILDER  (the decoded formula)
+-- BUFFER + FIRE
 -- ============================================================
 local function makeMineBuffer(worldPos, damage)
 	local b = buffer.create(32)
@@ -70,13 +69,11 @@ local function makeMineBuffer(worldPos, damage)
 	buffer.writef64(b, 24, damage)
 	return b
 end
-
 local function randomNonce()
 	return string.char(
 		math.random(0,255), math.random(0,255),
 		math.random(0,255), math.random(0,255))
 end
-
 local function fireMine(worldPos, dmg)
 	pcall(function()
 		R:FireServer(randomNonce(), "DamageBlockSmooth",
@@ -85,78 +82,51 @@ local function fireMine(worldPos, dmg)
 end
 
 -- ============================================================
--- HEX
--- ============================================================
-local function strHex(s, max)
-	max = max or 64; local n = math.min(#s, max); local out = {}
-	for i = 1, n do out[i] = string.format("%02x", string.byte(s, i)) end
-	local h = table.concat(out, " ")
-	if #s > n then h = h .. (" +%d"):format(#s - n) end
-	return h
-end
-local function bufHex(b, max)
-	local ok, raw = pcall(buffer.tostring, b)
-	if ok and type(raw) == "string" then return strHex(raw, max or 200), #raw end
-	return "<no>", 0
-end
-
--- ============================================================
 -- STATE
 -- ============================================================
 local stats = {
-	totalFires = 0, mineFires = 0,
-	captureRemaining = 0,
-	hookEnabled = true,
+	totalFires = 0,
 	radiusOn = false,
-	radius = 8,
-	rateHz = 10,
+	radius = 12,
+	rateHz = 20,
 	damage = 1.0,
-	radiusBlocksLastCycle = 0,
+	hitsPerBlock = 3,
+	blocksLastCycle = 0,
+	minedPerSec = 0,
+	minedThisSec = 0,
 }
 
 -- ============================================================
--- HOOK
+-- TRACK MINED BLOCKS (CollisionParts.ChildRemoved)
 -- ============================================================
-pcall(function()
-	local mt = getrawmetatable(game)
-	local setRO = setreadonly or make_writeable
-	local isRO  = isreadonly  or function() return true end
-	local newcc = newcclosure or function(f) return f end
-	if isRO(mt) then pcall(setRO, mt, false) end
-	local oldNC = mt.__namecall
-	mt.__namecall = newcc(function(self, ...)
-		if stats.hookEnabled then
-			local method = getnamecallmethod and getnamecallmethod() or ""
-			if method == "FireServer" or method == "InvokeServer" then
-				stats.totalFires = stats.totalFires + 1
-				local a2 = select(2, ...)
-				if type(a2) == "string" and a2 == "DamageBlockSmooth" then
-					stats.mineFires = stats.mineFires + 1
-					if stats.captureRemaining > 0 then
-						stats.captureRemaining = stats.captureRemaining - 1
-						local a1 = select(1, ...)
-						local a3 = select(3, ...)
-						local nhex = type(a1)=="string" and strHex(a1, 8) or "?"
-						local hex, len = "?", 0
-						if typeof(a3) == "buffer" then hex, len = bufHex(a3, 256) end
-						log(("[CAP%d] %s len=%d %s"):format(
-							stats.mineFires, nhex, len, hex))
-					end
-				end
-			end
+local removalConn
+local function attachMineCounter()
+	if removalConn then removalConn:Disconnect() end
+	local cp = Workspace:FindFirstChild("CollisionParts")
+	if not cp then return end
+	removalConn = cp.ChildRemoved:Connect(function(c)
+		if c:IsA("BasePart") then
+			stats.minedThisSec = stats.minedThisSec + 1
 		end
-		return oldNC(self, ...)
 	end)
-	pcall(setRO, mt, true)
+end
+attachMineCounter()
+Workspace.ChildAdded:Connect(function(c)
+	if c.Name == "CollisionParts" then attachMineCounter() end
 end)
 
-log(("===== RECON v8  %s ====="):format(os.date("%H:%M:%S")))
-log(("formula: bufZYX=(p-%d)/%d  · target=workspace.CollisionParts"):format(ORIGIN.X, BLOCK_SIZE))
+task.spawn(function()
+	while true do
+		task.wait(1.0)
+		stats.minedPerSec = stats.minedThisSec
+		stats.minedThisSec = 0
+	end
+end)
 
 -- ============================================================
 -- RADIUS MINE LOOP
 -- ============================================================
-local function getNearbyMineable(origin, radius)
+local function getSortedNearby(origin, radius)
 	local cp = Workspace:FindFirstChild("CollisionParts")
 	if not cp then return {} end
 	local r2 = radius * radius
@@ -164,11 +134,13 @@ local function getNearbyMineable(origin, radius)
 	for _, d in ipairs(cp:GetChildren()) do
 		if d:IsA("BasePart") then
 			local dp = d.Position - origin
-			if dp.X*dp.X + dp.Y*dp.Y + dp.Z*dp.Z <= r2 then
-				table.insert(out, d.Position)
+			local d2 = dp.X*dp.X + dp.Y*dp.Y + dp.Z*dp.Z
+			if d2 <= r2 then
+				table.insert(out, {pos=d.Position, d2=d2})
 			end
 		end
 	end
+	table.sort(out, function(a,b) return a.d2 < b.d2 end)
 	return out
 end
 
@@ -178,13 +150,17 @@ task.spawn(function()
 			local char = LocalPlayer.Character
 			local hrp = char and char:FindFirstChild("HumanoidRootPart")
 			if hrp then
-				local positions = getNearbyMineable(hrp.Position, stats.radius)
-				stats.radiusBlocksLastCycle = #positions
-				for _, p in ipairs(positions) do
-					fireMine(p, stats.damage)
+				local targets = getSortedNearby(hrp.Position, stats.radius)
+				stats.blocksLastCycle = #targets
+				-- Fire each block N times per cycle (closest first)
+				for hit = 1, stats.hitsPerBlock do
+					for _, t in ipairs(targets) do
+						fireMine(t.pos, stats.damage)
+						stats.totalFires = stats.totalFires + 1
+					end
 				end
 			else
-				stats.radiusBlocksLastCycle = 0
+				stats.blocksLastCycle = 0
 			end
 			task.wait(1 / math.max(1, stats.rateHz))
 		else
@@ -194,7 +170,7 @@ task.spawn(function()
 end)
 
 -- ============================================================
--- UI (compact 250×380)
+-- UI
 -- ============================================================
 local C = {
 	BG=Color3.fromRGB(14,19,33), DEEP=Color3.fromRGB(5,8,16),
@@ -207,11 +183,11 @@ local C = {
 local function corner(o,r) local c=Instance.new("UICorner") c.CornerRadius=UDim.new(0,r or 6) c.Parent=o end
 local function stroke(o,col,t) local s=Instance.new("UIStroke") s.Color=col s.Thickness=t or 1 s.Parent=o end
 
-local old = PlayerGui:FindFirstChild("MachinaReconV8")
+local old = PlayerGui:FindFirstChild("MachinaReconV9")
 if old then old:Destroy() end
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "MachinaReconV8"
+gui.Name = "MachinaReconV9"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -219,7 +195,7 @@ gui.DisplayOrder = 9999
 gui.Parent = PlayerGui
 
 local root = Instance.new("Frame")
-root.Size = UDim2.new(0, 260, 0, 400)
+root.Size = UDim2.new(0, 270, 0, 410)
 root.Position = UDim2.new(0, 12, 0, 80)
 root.BackgroundColor3 = C.BG
 root.BorderSizePixel = 0
@@ -242,7 +218,7 @@ fix.Position=UDim2.new(0,0,1,-10); fix.BackgroundColor3=C.DEEP
 fix.BorderSizePixel=0; fix.Parent=titleBar
 local titleLbl=Instance.new("TextLabel"); titleLbl.Size=UDim2.new(1,-50,1,0)
 titleLbl.Position=UDim2.new(0,8,0,0); titleLbl.BackgroundTransparency=1
-titleLbl.Text="RECON v8 — RADIUS MINE"; titleLbl.Font=Enum.Font.GothamBlack
+titleLbl.Text="RECON v9 — RADIUS MINE"; titleLbl.Font=Enum.Font.GothamBlack
 titleLbl.TextSize=10; titleLbl.TextColor3=C.GOLD
 titleLbl.TextXAlignment=Enum.TextXAlignment.Left; titleLbl.Parent=titleBar
 
@@ -253,14 +229,15 @@ hideBtn.Text="−"; hideBtn.Font=Enum.Font.GothamBlack
 hideBtn.TextSize=14; hideBtn.TextColor3=C.TXT
 hideBtn.Parent=titleBar; corner(hideBtn,4)
 
--- Status
+-- Status (28, two lines)
 local status=Instance.new("TextLabel")
-status.Size=UDim2.new(1,-12,0,20); status.Position=UDim2.new(0,6,0,28)
+status.Size=UDim2.new(1,-12,0,28); status.Position=UDim2.new(0,6,0,28)
 status.BackgroundColor3=C.CARD; status.BorderSizePixel=0
 status.Font=Enum.Font.Code; status.TextSize=9; status.TextColor3=C.OK
 status.Text="  ready"; status.TextXAlignment=Enum.TextXAlignment.Left
-status.Parent=root; corner(status,4)
-local sp=Instance.new("UIPadding"); sp.PaddingLeft=UDim.new(0,4); sp.Parent=status
+status.TextYAlignment=Enum.TextYAlignment.Top
+status.TextWrapped=true; status.Parent=root; corner(status,4)
+local sp=Instance.new("UIPadding"); sp.PaddingLeft=UDim.new(0,4); sp.PaddingTop=UDim.new(0,3); sp.Parent=status
 
 -- Button helpers
 local function btnPair(y, lT, lC, lF, rT, rC, rF)
@@ -289,17 +266,17 @@ local function btnFull(y, text, color, click)
 end
 local function pillRow(y, label, values, getter, setter)
 	local lbl = Instance.new("TextLabel")
-	lbl.Size=UDim2.new(0,60,0,20); lbl.Position=UDim2.new(0,6,0,y)
+	lbl.Size=UDim2.new(0,55,0,20); lbl.Position=UDim2.new(0,6,0,y)
 	lbl.BackgroundTransparency=1; lbl.Text=label
 	lbl.Font=Enum.Font.GothamBold; lbl.TextSize=9; lbl.TextColor3=C.DIM
 	lbl.TextXAlignment=Enum.TextXAlignment.Left; lbl.Parent=root
 	local boxes = {}
-	local total = 250 - 70
+	local total = 270 - 70
 	for i, v in ipairs(values) do
 		local pillW = (total / #values) - 4
 		local b = Instance.new("TextButton")
 		b.Size=UDim2.new(0,pillW,0,20)
-		b.Position=UDim2.new(0, 70+(i-1)*(pillW+4), 0, y)
+		b.Position=UDim2.new(0, 65+(i-1)*(pillW+4), 0, y)
 		b.BackgroundColor3 = (getter() == v) and C.BLUE or C.CARD
 		b.AutoButtonColor=false; b.Text=tostring(v); b.Font=Enum.Font.GothamBold
 		b.TextSize=9; b.TextColor3=C.TXT; b.Parent=root; corner(b,4)
@@ -314,68 +291,34 @@ local function pillRow(y, label, values, getter, setter)
 end
 
 -- Row: Auto on / off
-btnPair(54,
+btnPair(62,
 	"★ AUTO ON", C.OK, function()
 		pcall(function() R:FireServer(MAGIC_NONCE, "SetAutoMine", true) end)
-		log("→ SetAutoMine TRUE")
 	end,
 	"■ AUTO OFF", C.RED, function()
 		pcall(function() R:FireServer(MAGIC_NONCE, "SetAutoMine", false) end)
-		log("→ SetAutoMine FALSE")
 	end)
 
--- Row: Test 1 Block / Capture
-btnPair(84,
-	"🔨 Test 1 Block", C.GOLD, function()
-		local cp = Workspace:FindFirstChild("CollisionParts")
-		if not cp then log("no CollisionParts"); return end
-		local char = LocalPlayer.Character
-		local hrp = char and char:FindFirstChild("HumanoidRootPart")
-		if not hrp then log("no character"); return end
-		local nearest, nd = nil, math.huge
-		for _, d in ipairs(cp:GetChildren()) do
-			if d:IsA("BasePart") then
-				local dist = (d.Position - hrp.Position).Magnitude
-				if dist < nd then nearest, nd = d, dist end
-			end
-		end
-		if not nearest then log("no mineable parts"); return end
-		local p = nearest.Position
-		log(("test: world=(%.0f,%.0f,%.0f) d=%.1f"):format(p.X, p.Y, p.Z, nd))
-		log(("  → buf=(Z=%.1f, Y=%.1f, X=%.1f, dmg=1)"):format(
-			(p.Z-ORIGIN.Z)/BLOCK_SIZE, (p.Y-ORIGIN.Y)/BLOCK_SIZE, (p.X-ORIGIN.X)/BLOCK_SIZE))
-		fireMine(p, 1.0)
-	end,
-	"📸 Capture 3", C.PURPLE, function()
-		stats.captureRemaining = 3
-		log("capture armed (3 mines)")
-	end)
-
--- Row: hook toggle / save
-local hookBtn, fileBtn
-hookBtn = btnFull(114, "Hook: ON", C.WARN, function()
-	stats.hookEnabled = not stats.hookEnabled
-	hookBtn.Text = stats.hookEnabled and "Hook: ON" or "Hook: OFF"
-	hookBtn.BackgroundColor3 = stats.hookEnabled and C.WARN or C.CARD
-end)
-
--- RADIUS MINE section
+-- RADIUS MINE big button
 local rmBtn
-rmBtn = btnFull(148, "RADIUS MINE: OFF", C.RED, function()
+rmBtn = btnFull(92, "RADIUS MINE: OFF", C.RED, function()
 	stats.radiusOn = not stats.radiusOn
 	rmBtn.Text = stats.radiusOn and "RADIUS MINE: ON ✦" or "RADIUS MINE: OFF"
 	rmBtn.BackgroundColor3 = stats.radiusOn and C.OK or C.RED
-	log("radius "..(stats.radiusOn and "STARTED" or "STOPPED"))
 end)
 
-pillRow(180, "Radius", {6,12,18,24,36}, function() return stats.radius end,
+pillRow(124, "Radius", {6,12,18,24,36}, function() return stats.radius end,
 	function(v) stats.radius = v end)
-pillRow(206, "Rate Hz", {2,5,10,20,30}, function() return stats.rateHz end,
+pillRow(150, "Rate Hz", {5,10,20,30,60}, function() return stats.rateHz end,
 	function(v) stats.rateHz = v end)
-pillRow(232, "Damage", {0.05, 0.5, 1, 5, 100}, function() return stats.damage end,
+pillRow(176, "Hits/blk", {1,3,5,10}, function() return stats.hitsPerBlock end,
+	function(v) stats.hitsPerBlock = v end)
+pillRow(202, "Damage", {0.05, 0.5, 1, 5, 100}, function() return stats.damage end,
 	function(v) stats.damage = v end)
 
-fileBtn = btnFull(264, "💾 Save Log to File", C.BLUE, function()
+-- Save / Hint
+local fileBtn
+fileBtn = btnFull(234, "💾 Save Log to File", C.BLUE, function()
 	if not _writefile then fileBtn.Text="✗ no writefile"; return end
 	local payload = table.concat(LOG, "\n")
 	local ok, err = pcall(_writefile, OUT_FILE, payload)
@@ -384,9 +327,18 @@ fileBtn = btnFull(264, "💾 Save Log to File", C.BLUE, function()
 	task.delay(2.5, function() if fileBtn.Parent then fileBtn.Text = "💾 Save Log to File" end end)
 end)
 
+local hint = Instance.new("TextLabel")
+hint.Size=UDim2.new(1,-12,0,28); hint.Position=UDim2.new(0,6,0,264)
+hint.BackgroundColor3=C.CARD; hint.BorderSizePixel=0
+hint.Font=Enum.Font.Code; hint.TextSize=8; hint.TextColor3=C.DIM
+hint.Text="  Server enforces your Range upgrade for mining.\n  Far blocks silently fail. Try damage=100."
+hint.TextXAlignment=Enum.TextXAlignment.Left; hint.TextYAlignment=Enum.TextYAlignment.Top
+hint.TextWrapped=true; hint.Parent=root; corner(hint,4)
+local hp=Instance.new("UIPadding"); hp.PaddingLeft=UDim.new(0,4); hp.PaddingTop=UDim.new(0,3); hp.Parent=hint
+
 -- LOG
 local logFrame = Instance.new("ScrollingFrame")
-logFrame.Size=UDim2.new(1,-12,1,-300); logFrame.Position=UDim2.new(0,6,0,294)
+logFrame.Size=UDim2.new(1,-12,1,-306); logFrame.Position=UDim2.new(0,6,0,300)
 logFrame.BackgroundColor3=C.DEEP; logFrame.BorderSizePixel=0
 logFrame.ScrollBarThickness=4; logFrame.AutomaticCanvasSize=Enum.AutomaticSize.Y
 logFrame.CanvasSize=UDim2.new(0,0,0,0)
@@ -424,11 +376,11 @@ do
 	end)
 end
 
--- Hide/Show
+-- Hide / Show
 local bubble = Instance.new("TextButton")
 bubble.Size=UDim2.new(0,44,0,44); bubble.Position=UDim2.new(0,12,0,12)
 bubble.BackgroundColor3=C.GOLD; bubble.AutoButtonColor=false
-bubble.Text="R8"; bubble.Font=Enum.Font.GothamBlack
+bubble.Text="R9"; bubble.Font=Enum.Font.GothamBlack
 bubble.TextSize=14; bubble.TextColor3=C.DEEP
 bubble.Visible=false; bubble.ZIndex=10100; bubble.Parent=gui
 do
@@ -443,13 +395,12 @@ task.spawn(function()
 	while gui.Parent do
 		task.wait(0.4)
 		if status.Parent then
-			status.Text = ("  fires=%d mines=%d radius=%s blocks=%d"):format(
-				stats.totalFires, stats.mineFires,
-				stats.radiusOn and "ON" or "off",
-				stats.radiusBlocksLastCycle)
+			status.Text = ("  RADIUS=%s  blocks_in_range=%d\n  MINED/sec=%d  fires_sent=%d"):format(
+				stats.radiusOn and "ON " or "off",
+				stats.blocksLastCycle, stats.minedPerSec, stats.totalFires)
 		end
 		if logText.Parent then
-			local start = math.max(1, #LOG - 30)
+			local start = math.max(1, #LOG - 25)
 			local arr = {}
 			for i = start, #LOG do arr[#arr+1] = LOG[i] end
 			logText.Text = table.concat(arr, "\n")
