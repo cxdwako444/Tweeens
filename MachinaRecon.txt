@@ -1,22 +1,23 @@
 --!nocheck
 -- ============================================================
--- MACHINA RECON v15  —  AUTO-PULSE + JITTER
+-- MACHINA RECON v16  —  FOCUSED ROUND-ROBIN
 -- Branch: claude/rare-indicator-auto-aim-mC8LF
 -- File:   MachinaRecon.txt
 --
--- DECODED FROM YOUR v14 LOG:
---   Fresh-bucket burst: 45-80 mines/sec for ~2-4 seconds, then
---   throttled to ~10/sec until cooldown. Manually toggling off/on
---   reset the bucket. v15 automates that loop.
+-- WHAT THE v15 LOG TAUGHT US:
+--   - Server caps mining at ~15-30 sustained, ~80-110 peak per second
+--   - 1500+ fires/sec was just lagging your client. Same mines came
+--     out as v14 at 60-80 fires/sec.
+--   - Pulse + jitter + multi-hit added zero throughput.
 --
--- v15 ADDS:
---   - PULSE MODE (default ON): auto-cycles SetMode "Mine"→"None"
---     with tunable burst/rest. Maximizes time spent in fresh-bucket.
---   - HIT MULTIPLIER: fire each block N times per cycle (more damage
---     stacked into burst window).
---   - DAMAGE JITTER: randomizes each fire's damage slightly so the
---     server can't rate-limit identical signatures together.
---   - Tuned defaults: r=24, tgts=20, burst=1.5s, rest=0.8s
+-- v16 STRATEGY:
+--   Round-robin focus on the N closest blocks. One fire per cycle,
+--   rotating through the pool. At 30Hz with N=8, each block gets
+--   ~4 hits/sec — enough to break in ~3 sec, but you've got 8 dying
+--   simultaneously. Result: steady ~3-8 mines/sec with NO lag.
+--
+--   Total fire rate is hard-capped at 60/sec. Anything more was
+--   pure waste plus client lag.
 -- ============================================================
 
 local Players          = game:GetService("Players")
@@ -32,6 +33,7 @@ local R              = ReplicatedStorage:WaitForChild("RemoteEvent")
 local ORIGIN         = Vector3.new(12000, 12000, 12000)
 local BLOCK_SIZE     = 6
 local MINE_PROXIMITY = 40
+local FIRE_HARD_CAP  = 60   -- max fires per second regardless of settings
 
 -- ============================================================
 -- ENV
@@ -86,7 +88,7 @@ local function setMineMode(on)
 end
 
 -- ============================================================
--- TARGETS
+-- TARGETS — collect once per cycle, sort, dedupe by grid
 -- ============================================================
 local function collectTargets(playerPos, radius)
 	local r2 = radius * radius
@@ -126,15 +128,10 @@ end
 -- ============================================================
 local stats = {
 	radiusOn = false,
-	pulseOn = true,        -- auto cycle SetMode on/off
-	burstSec = 1.5,
-	restSec = 0.8,
-	radius = 24,
-	maxTgts = 20,
-	rateHz = 20,
-	hits = 2,              -- multi-hit per cycle
-	damage = 0.05,
-	jitter = true,
+	radius = 18,
+	maxTgts = 8,        -- size of round-robin pool
+	rateHz = 30,        -- cycle Hz; fires/sec = min(rateHz, FIRE_HARD_CAP)
+	damage = 0.1,       -- matches your real captures (0.016 - 0.117)
 	totalFires = 0,
 	firesThisSec = 0,
 	firesPerSec = 0,
@@ -142,11 +139,11 @@ local stats = {
 	minedPerSec = 0,
 	totalMined = 0,
 	targetsFound = 0,
-	pulsePhase = "rest",   -- "burst" or "rest"
+	rrIdx = 1,
 }
 
 -- ============================================================
--- HONEST MINE COUNTER
+-- HONEST MINE COUNTER (only count nearby part removals)
 -- ============================================================
 local function attachWatcher(folder)
 	if not folder then return end
@@ -168,79 +165,49 @@ Workspace.ChildAdded:Connect(function(c)
 	if c.Name == "CollisionParts" or c.Name == "Blocks" then attachWatcher(c) end
 end)
 
--- Per-second ticker
+-- Per-second tick
 task.spawn(function()
 	while true do
 		task.wait(1.0)
 		stats.minedPerSec = stats.minedThisSec; stats.minedThisSec = 0
 		stats.firesPerSec = stats.firesThisSec; stats.firesThisSec = 0
 		if stats.radiusOn then
-			log(("%s tgts=%d f/s=%d MINED=%d tot=%d"):format(
-				stats.pulsePhase=="burst" and "▶" or "·",
+			log(("tgts=%d  fires/s=%d  MINED/s=%d  tot=%d"):format(
 				stats.targetsFound, stats.firesPerSec, stats.minedPerSec, stats.totalMined))
 		end
 	end
 end)
 
 -- ============================================================
--- PULSE LOOP — auto-cycles burst/rest while RM is on
+-- MINING LOOP — round-robin, ONE fire per cycle
 -- ============================================================
 task.spawn(function()
 	while true do
-		if stats.radiusOn and stats.pulseOn then
-			stats.pulsePhase = "burst"
-			setMineMode(true)
-			task.wait(stats.burstSec)
-			stats.pulsePhase = "rest"
-			setMineMode(false)
-			task.wait(stats.restSec)
-		elseif stats.radiusOn and not stats.pulseOn then
-			stats.pulsePhase = "burst"
-			task.wait(0.2)
-		else
-			stats.pulsePhase = "rest"
-			task.wait(0.2)
-		end
-	end
-end)
-
--- ============================================================
--- MINING LOOP — only fires during burst phase
--- ============================================================
-task.spawn(function()
-	while true do
-		if stats.radiusOn and stats.pulsePhase == "burst" then
+		if stats.radiusOn and stats.firesThisSec < FIRE_HARD_CAP then
 			local char = LocalPlayer.Character
 			local hrp = char and char:FindFirstChild("HumanoidRootPart")
 			if hrp then
 				local targets = collectTargets(hrp.Position, stats.radius)
 				stats.targetsFound = #targets
-				local n = math.min(stats.maxTgts, #targets)
-				for h = 1, stats.hits do
-					for i = 1, n do
-						local t = targets[i]
-						local d = stats.damage
-						if stats.jitter then
-							d = d * (0.5 + math.random() * 1.0)
-						end
-						fireMine(t.x, t.y, t.z, d)
-						stats.totalFires = stats.totalFires + 1
-						stats.firesThisSec = stats.firesThisSec + 1
-					end
+				if #targets > 0 then
+					local n = math.min(stats.maxTgts, #targets)
+					local idx = ((stats.rrIdx - 1) % n) + 1
+					stats.rrIdx = stats.rrIdx + 1
+					local t = targets[idx]
+					fireMine(t.x, t.y, t.z, stats.damage)
+					stats.totalFires = stats.totalFires + 1
+					stats.firesThisSec = stats.firesThisSec + 1
 				end
 			else
 				stats.targetsFound = 0
 			end
-			task.wait(1 / math.max(1, stats.rateHz))
-		else
-			stats.targetsFound = 0
-			task.wait(0.1)
 		end
+		task.wait(1 / math.max(1, stats.rateHz))
 	end
 end)
 
 -- ============================================================
--- UI
+-- UI — compact
 -- ============================================================
 local C = {
 	BG=Color3.fromRGB(14,19,33), DEEP=Color3.fromRGB(5,8,16),
@@ -253,11 +220,11 @@ local C = {
 local function corner(o,r) local c=Instance.new("UICorner") c.CornerRadius=UDim.new(0,r or 5) c.Parent=o end
 local function stroke(o,col,t) local s=Instance.new("UIStroke") s.Color=col s.Thickness=t or 1 s.Parent=o end
 
-local old = PlayerGui:FindFirstChild("MachinaReconV15")
+local old = PlayerGui:FindFirstChild("MachinaReconV16")
 if old then old:Destroy() end
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "MachinaReconV15"
+gui.Name = "MachinaReconV16"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -265,7 +232,7 @@ gui.DisplayOrder = 9999
 gui.Parent = PlayerGui
 
 local root = Instance.new("Frame")
-root.Size = UDim2.new(0, 230, 0, 380)
+root.Size = UDim2.new(0, 220, 0, 320)
 root.Position = UDim2.new(0, 10, 0, 60)
 root.BackgroundColor3 = C.BG
 root.BorderSizePixel = 0
@@ -288,7 +255,7 @@ fix.Position=UDim2.new(0,0,1,-8); fix.BackgroundColor3=C.DEEP
 fix.BorderSizePixel=0; fix.Parent=titleBar
 local titleLbl=Instance.new("TextLabel"); titleLbl.Size=UDim2.new(1,-30,1,0)
 titleLbl.Position=UDim2.new(0,7,0,0); titleLbl.BackgroundTransparency=1
-titleLbl.Text="RECON v15 PULSE"; titleLbl.Font=Enum.Font.GothamBlack
+titleLbl.Text="RECON v16  FOCUS"; titleLbl.Font=Enum.Font.GothamBlack
 titleLbl.TextSize=10; titleLbl.TextColor3=C.GOLD
 titleLbl.TextXAlignment=Enum.TextXAlignment.Left; titleLbl.Parent=titleBar
 
@@ -299,7 +266,7 @@ hideBtn.Text="−"; hideBtn.Font=Enum.Font.GothamBlack
 hideBtn.TextSize=12; hideBtn.TextColor3=C.TXT
 hideBtn.Parent=titleBar; corner(hideBtn,3)
 
--- Status (32, 2 lines + phase indicator)
+-- Status
 local status=Instance.new("TextLabel")
 status.Size=UDim2.new(1,-10,0,32); status.Position=UDim2.new(0,5,0,25)
 status.BackgroundColor3=C.CARD; status.BorderSizePixel=0
@@ -309,7 +276,7 @@ status.TextYAlignment=Enum.TextYAlignment.Top
 status.TextWrapped=true; status.Parent=root; corner(status,4)
 local sp=Instance.new("UIPadding"); sp.PaddingLeft=UDim.new(0,5); sp.PaddingTop=UDim.new(0,2); sp.Parent=status
 
--- Big RM toggle
+-- RM toggle
 local rmBtn = Instance.new("TextButton")
 rmBtn.Size=UDim2.new(1,-10,0,30); rmBtn.Position=UDim2.new(0,5,0,60)
 rmBtn.BackgroundColor3=C.RED; rmBtn.AutoButtonColor=false
@@ -320,22 +287,13 @@ rmBtn.MouseButton1Click:Connect(function()
 	stats.radiusOn = not stats.radiusOn
 	rmBtn.Text = stats.radiusOn and "RADIUS MINE: ON ✦" or "RADIUS MINE: OFF"
 	rmBtn.BackgroundColor3 = stats.radiusOn and C.OK or C.RED
-	log("RM " .. (stats.radiusOn and "ON" or "OFF"))
-	if not stats.radiusOn then setMineMode(false) end
-end)
-
--- Pulse toggle
-local pulseBtn = Instance.new("TextButton")
-pulseBtn.Size=UDim2.new(1,-10,0,22); pulseBtn.Position=UDim2.new(0,5,0,94)
-pulseBtn.BackgroundColor3=C.OK; pulseBtn.AutoButtonColor=false
-pulseBtn.Text="PULSE: ON  (burst/rest cycling)"; pulseBtn.Font=Enum.Font.GothamBold
-pulseBtn.TextSize=9; pulseBtn.TextColor3=C.TXT
-pulseBtn.Parent=root; corner(pulseBtn,4)
-pulseBtn.MouseButton1Click:Connect(function()
-	stats.pulseOn = not stats.pulseOn
-	pulseBtn.Text = stats.pulseOn and "PULSE: ON  (burst/rest cycling)" or "PULSE: OFF (continuous)"
-	pulseBtn.BackgroundColor3 = stats.pulseOn and C.OK or C.CARD
-	log("PULSE " .. (stats.pulseOn and "ON" or "OFF"))
+	if stats.radiusOn then
+		setMineMode(true)
+		log("RM ON  SetMode(Mine)")
+	else
+		setMineMode(false)
+		log("RM OFF")
+	end
 end)
 
 local function pillRow(y, label, values, getter, setter)
@@ -345,7 +303,7 @@ local function pillRow(y, label, values, getter, setter)
 	lbl.Font=Enum.Font.GothamBold; lbl.TextSize=8; lbl.TextColor3=C.DIM
 	lbl.TextXAlignment=Enum.TextXAlignment.Left; lbl.Parent=root
 	local boxes = {}
-	local total = 230 - 55
+	local total = 220 - 55
 	for i, v in ipairs(values) do
 		local pillW = (total / #values) - 3
 		local b = Instance.new("TextButton")
@@ -364,13 +322,11 @@ local function pillRow(y, label, values, getter, setter)
 	end
 end
 
-pillRow(122, "Burst",{0.5,1,1.5,2,3},     function() return stats.burstSec end, function(v) stats.burstSec=v end)
-pillRow(144, "Rest", {0.3,0.5,0.8,1.5,3}, function() return stats.restSec end,  function(v) stats.restSec=v end)
-pillRow(166, "Rad",  {12,18,24,36,50},    function() return stats.radius end,   function(v) stats.radius=v end)
-pillRow(188, "Tgts", {5,10,20,30,50},     function() return stats.maxTgts end,  function(v) stats.maxTgts=v end)
-pillRow(210, "Hits", {1,2,3,5},           function() return stats.hits end,     function(v) stats.hits=v end)
+pillRow( 96, "Rad",  {12,18,24,36,50},          function() return stats.radius end,  function(v) stats.radius=v end)
+pillRow(118, "Pool", {3,5,8,12,20},             function() return stats.maxTgts end, function(v) stats.maxTgts=v end)
+pillRow(140, "Hz",   {10,20,30,45,60},          function() return stats.rateHz end,  function(v) stats.rateHz=v end)
+pillRow(162, "Dmg",  {0.05,0.1,0.2,0.5,1},      function() return stats.damage end,  function(v) stats.damage=v end)
 
--- Auto + Save + Mark
 local function smallBtn(x, y, w, text, color, click)
 	local b = Instance.new("TextButton")
 	b.Size=UDim2.new(0,w,0,22); b.Position=UDim2.new(0,x,0,y)
@@ -380,25 +336,27 @@ local function smallBtn(x, y, w, text, color, click)
 	b.MouseButton1Click:Connect(click)
 	return b
 end
-smallBtn(5, 234, 108, "★ AUTO ON", C.OK, function()
+
+smallBtn(5, 186, 103, "★ AUTO ON", C.OK, function()
 	pcall(function() R:FireServer(MAGIC_NONCE, "SetAutoMine", true) end)
+	log("AutoMine TRUE")
 end)
-smallBtn(113, 234, 112, "■ AUTO OFF", C.RED, function()
+smallBtn(112, 186, 103, "■ AUTO OFF", C.RED, function()
 	pcall(function() R:FireServer(MAGIC_NONCE, "SetAutoMine", false) end)
+	log("AutoMine FALSE")
 end)
 
-local saveBtn = smallBtn(5, 258, 108, "💾 Save log", C.BLUE, function() end)
+local saveBtn = smallBtn(5, 210, 103, "💾 Save log", C.BLUE, function() end)
 saveBtn.MouseButton1Click:Connect(function()
 	if not _writefile then saveBtn.Text="✗"; return end
 	local hdr = {
-		"===== RECON v15 LOG =====",
+		"===== RECON v16 LOG =====",
 		("Saved: %s"):format(os.date("%Y-%m-%d %H:%M:%S")),
-		("RM=%s pulse=%s burst=%ss rest=%ss r=%d tgts=%d hits=%d dmg=%s jitter=%s"):format(
+		("Player: %s  PlaceId: %d"):format(LocalPlayer.Name, game.PlaceId),
+		("RM=%s r=%d pool=%d hz=%d dmg=%s cap=%d"):format(
 			stats.radiusOn and "ON" or "OFF",
-			stats.pulseOn and "ON" or "OFF",
-			stats.burstSec, stats.restSec,
-			stats.radius, stats.maxTgts, stats.hits,
-			tostring(stats.damage), tostring(stats.jitter)),
+			stats.radius, stats.maxTgts, stats.rateHz,
+			tostring(stats.damage), FIRE_HARD_CAP),
 		("fires=%d  mined=%d  fires/s=%d  mined/s=%d"):format(
 			stats.totalFires, stats.totalMined, stats.firesPerSec, stats.minedPerSec),
 		"",
@@ -410,11 +368,11 @@ saveBtn.MouseButton1Click:Connect(function()
 	saveBtn.Text = ok and ("✓ "..#payload.."b") or "✗"
 	task.delay(2, function() if saveBtn.Parent then saveBtn.Text="💾 Save log" end end)
 end)
-smallBtn(113, 258, 112, "+ Mark", C.WARN, function() log("=== MARK ===") end)
+smallBtn(112, 210, 103, "+ Mark", C.WARN, function() log("=== MARK ===") end)
 
--- LOG (compact)
+-- LOG
 local logFrame = Instance.new("ScrollingFrame")
-logFrame.Size=UDim2.new(1,-10,1,-290); logFrame.Position=UDim2.new(0,5,0,286)
+logFrame.Size=UDim2.new(1,-10,1,-242); logFrame.Position=UDim2.new(0,5,0,238)
 logFrame.BackgroundColor3=C.DEEP; logFrame.BorderSizePixel=0
 logFrame.ScrollBarThickness=3; logFrame.AutomaticCanvasSize=Enum.AutomaticSize.Y
 logFrame.CanvasSize=UDim2.new(0,0,0,0)
@@ -456,7 +414,7 @@ end
 local bubble = Instance.new("TextButton")
 bubble.Size=UDim2.new(0,40,0,40); bubble.Position=UDim2.new(0,10,0,10)
 bubble.BackgroundColor3=C.GOLD; bubble.AutoButtonColor=false
-bubble.Text="R15"; bubble.Font=Enum.Font.GothamBlack
+bubble.Text="R16"; bubble.Font=Enum.Font.GothamBlack
 bubble.TextSize=11; bubble.TextColor3=C.DEEP
 bubble.Visible=false; bubble.ZIndex=10100; bubble.Parent=gui
 do
@@ -466,15 +424,13 @@ end
 hideBtn.MouseButton1Click:Connect(function() root.Visible=false; bubble.Visible=true end)
 bubble.MouseButton1Click:Connect(function() root.Visible=true; bubble.Visible=false end)
 
--- Updater
 task.spawn(function()
 	while gui.Parent do
 		task.wait(0.3)
 		if status.Parent then
-			status.Text = ("  %s %s  tgts=%d\n  f/s=%d  MINED/s=%d  tot=%d"):format(
-				stats.radiusOn and "ON" or "off",
-				stats.pulsePhase == "burst" and "▶BURST" or "·rest",
-				stats.targetsFound, stats.firesPerSec,
+			status.Text = ("  %s  tgts=%d\n  fires/s=%d (cap %d)  MINED=%d  tot=%d"):format(
+				stats.radiusOn and "ON ✦" or "off",
+				stats.targetsFound, stats.firesPerSec, FIRE_HARD_CAP,
 				stats.minedPerSec, stats.totalMined)
 		end
 		if logText.Parent then
@@ -487,5 +443,5 @@ task.spawn(function()
 	end
 end)
 
-log("v15 PULSE ready · default burst=1.5s rest=0.8s")
-log("flip PULSE off if you want continuous (old behavior)")
+log("v16 ready  hard-cap=60 fires/s  default r=18 pool=8 hz=30 dmg=0.1")
+log("no more pulse, no jitter, no multi-hit — focused round-robin")
