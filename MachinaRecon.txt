@@ -1,42 +1,23 @@
 --!nocheck
 -- ============================================================
--- MACHINA RECON FULL  —  Mining + Auto reverse-engineering kit
--- Delta-compatible. Single output file: MachinaRecon.txt
--- (in Delta's Workspace folder)
+-- MACHINA RECON FULL  v2  (UI-first, non-blocking)
+-- Delta-compatible. Output: Delta/Workspace/MachinaRecon.txt
 --
--- WHAT IT CAPTURES:
---   1. Inventory of every RemoteEvent / RemoteFunction / Bindable
---   2. Full Tool dump (Backpack, StarterPack, Character) with
---      LocalScript source DECOMPILED inline
---   3. All ScreenGuis in PlayerGui + their script sources
---      (the Auto button UI lives here)
---   4. Mining-related ModuleScripts in ReplicatedStorage with source
---   5. Live [FIRE] log of every FireServer / InvokeServer call
---   6. Marker buttons so you can label each action in the log
---
--- HOW TO USE:
---   1. Execute the script in-game with a pickaxe / Machina Relic
---      in your inventory.
---   2. Wait ~5 seconds for the initial dump (it decompiles scripts).
---   3. Use the marker buttons IN THIS ORDER and do the action
---      AFTER tapping the marker:
---        ▸ Tap "MARK: MANUAL MINE", then mine ONE block manually
---        ▸ Tap "MARK: AUTO ON",    then click Machina Relic Auto
---        ▸ Wait 5-10s for auto to fire several times
---        ▸ Tap "MARK: AUTO OFF",   then turn Auto off
---        ▸ Tap "MARK: SELL",       then sell/walk into seller
---   4. Tap "SAVE" to force a final flush.
---   5. Open Delta → file manager → Workspace → MachinaRecon.txt
---      → upload here.
+-- Fixes from v1:
+--   - UI now appears INSTANTLY (was hidden behind ~30s of decompiles)
+--   - All dumping runs in a background task with a live progress bar
+--   - Every dump step pcall-wrapped so one bad script can't kill it
+--   - Lower decompile timeout (2s) and a hard cap on script count
+--   - Verbose prints to Delta's console so you always know it's alive
 -- ============================================================
 
+print("[Recon] script loading...")
+
 local Players          = game:GetService("Players")
-local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage= game:GetService("ReplicatedStorage")
 local StarterPack      = game:GetService("StarterPack")
 local StarterPlayer    = game:GetService("StarterPlayer")
-local TweenService     = game:GetService("TweenService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
@@ -44,35 +25,36 @@ local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
 -- ============================================================
 -- CONFIG
 -- ============================================================
-local OUT_FILE        = "MachinaRecon.txt"
-local MAX_SRC_BYTES   = 60000   -- truncate huge sources
-local DECOMPILE_TIME  = 4       -- seconds per decompile attempt
+local OUT_FILE       = "MachinaRecon.txt"
+local MAX_SRC_BYTES  = 50000
+local DECOMPILE_TIME = 2
+local MAX_MODULES    = 60   -- safety cap
 
--- Keywords used to flag relevant remotes/modules/scripts
 local KEYWORDS = {
-	"mine", "machina", "relic", "auto", "break", "hit",
-	"swing", "dig", "ore", "block", "pickaxe", "tool",
-	"sell", "inventory", "currency", "coin", "shop",
-	"activate", "use", "equip", "cooldown",
+	"mine","machina","relic","auto","break","hit",
+	"swing","dig","ore","block","pickaxe","tool",
+	"sell","inventory","currency","coin","shop",
+	"activate","use","equip","cooldown",
 }
 
 -- ============================================================
--- FS (Delta: writefile / appendfile / readfile / isfile)
+-- FS HELPERS (Delta)
 -- ============================================================
-local function get(n) return rawget(getfenv(0), n) or rawget(_G, n) end
-local _writefile  = writefile  or get("writefile")
-local _appendfile = appendfile or get("appendfile")
-local _readfile   = readfile   or get("readfile")
-local _isfile     = isfile     or get("isfile")
-
-local _decompile  = decompile  or get("decompile")
-local _getscripts = getscripts or get("getscripts") or get("get_scripts")
-local _getloaded  = getloadedmodules or get("getloadedmodules") or get("get_loaded_modules")
-local _getbyte    = getscriptbytecode or get("getscriptbytecode")
-
-if not _writefile then
-	warn("[Recon] No writefile() — Delta needed.")
+local function g(n)
+	local ok, v = pcall(function() return getfenv()[n] end)
+	if ok and v then return v end
+	return rawget(_G, n)
 end
+local _writefile  = g("writefile")
+local _appendfile = g("appendfile")
+local _readfile   = g("readfile")
+local _isfile     = g("isfile")
+local _decompile  = g("decompile")
+local _getloaded  = g("getloadedmodules") or g("get_loaded_modules")
+local _getscripts = g("getscripts") or g("get_scripts")
+
+print(("[Recon] writefile=%s decompile=%s"):format(
+	tostring(_writefile~=nil), tostring(_decompile~=nil)))
 
 local _buf, _saving = {}, false
 local function flush()
@@ -95,393 +77,100 @@ local function flush()
 end
 
 local function log(line)
-	table.insert(_buf, line)
+	table.insert(_buf, tostring(line))
 	if #_buf >= 20 then flush() end
 end
 
--- wipe file on each run
-if _writefile then pcall(function() _writefile(OUT_FILE, "") end) end
-
-task.spawn(function()
-	while true do task.wait(1.5); flush() end
-end)
+if _writefile then pcall(_writefile, OUT_FILE, "") end
+task.spawn(function() while true do task.wait(1.5); flush() end end)
 
 -- ============================================================
--- HELPERS
+-- UI  (BUILD FIRST — must be visible immediately)
 -- ============================================================
-local function flag(s)
-	if type(s) ~= "string" then return false end
-	local low = s:lower()
-	for _, k in ipairs(KEYWORDS) do
-		if low:find(k, 1, true) then return true end
-	end
-	return false
-end
+print("[Recon] building UI...")
 
-local function banner(title)
-	log("")
-	log("################################################################")
-	log("###  " .. title)
-	log("################################################################")
-end
-
-local function section(title)
-	log("")
-	log("----- " .. title .. " -----")
-end
-
-local function tryDecompile(s)
-	if not _decompile then return nil, "no-decompile" end
-	local done, src, err = false, nil, nil
-	task.spawn(function()
-		local ok, res = pcall(_decompile, s)
-		if ok then src = res else err = tostring(res) end
-		done = true
-	end)
-	local t0 = tick()
-	while not done and (tick() - t0) < DECOMPILE_TIME do task.wait(0.1) end
-	if not done then return nil, "timeout" end
-	if not src or src == "" then return nil, err or "empty" end
-	if #src > MAX_SRC_BYTES then
-		src = src:sub(1, MAX_SRC_BYTES) .. "\n-- [TRUNCATED at " .. MAX_SRC_BYTES .. " bytes] --"
-	end
-	return src
-end
-
-local function dumpScriptSource(s, indent)
-	indent = indent or ""
-	local src, err = tryDecompile(s)
-	if not src then
-		log(indent .. "  -- <decompile failed: " .. tostring(err) .. ">")
-		-- fallback: try bytecode (rare but useful)
-		if _getbyte then
-			local ok, bc = pcall(_getbyte, s)
-			if ok and bc and #bc > 0 then
-				log(indent .. "  -- bytecode size: " .. #bc .. " bytes")
-			end
-		end
-		return
-	end
-	log(indent .. "  >>>>>>> SOURCE >>>>>>>")
-	for line in src:gmatch("([^\n]*)\n?") do
-		log(indent .. line)
-	end
-	log(indent .. "  <<<<<<< END SOURCE <<<<<<<")
-end
-
--- ============================================================
--- SERIALIZER for remote args
--- ============================================================
-local function ser(v, d)
-	d = d or 0
-	if d > 3 then return "<deep>" end
-	local t = typeof(v)
-	if t == "Instance" then
-		local cls, fn = "?", "?"
-		pcall(function() cls = v.ClassName end)
-		pcall(function() fn  = v:GetFullName() end)
-		return ("<%s:%s>"):format(cls, fn)
-	elseif t == "Vector3" then return ("V3(%.1f,%.1f,%.1f)"):format(v.X, v.Y, v.Z)
-	elseif t == "Vector2" then return ("V2(%.1f,%.1f)"):format(v.X, v.Y)
-	elseif t == "CFrame"  then local p = v.Position; return ("CF(%.1f,%.1f,%.1f)"):format(p.X, p.Y, p.Z)
-	elseif t == "Color3"  then return ("C3(%d,%d,%d)"):format(v.R*255, v.G*255, v.B*255)
-	elseif t == "EnumItem" then return tostring(v)
-	elseif t == "string" then return ("%q"):format(v)
-	elseif t == "number" or t == "boolean" or t == "nil" then return tostring(v)
-	elseif t == "table" then
-		local parts, n = {}, 0
-		for k, vv in pairs(v) do
-			n = n + 1
-			if n > 16 then table.insert(parts, "..."); break end
-			table.insert(parts, ("[%s]=%s"):format(ser(k, d+1), ser(vv, d+1)))
-		end
-		return "{" .. table.concat(parts, ", ") .. "}"
-	end
-	return ("<%s>"):format(t)
-end
-
-local function serArgs(...)
-	local n, parts = select("#", ...), {}
-	for i = 1, n do parts[i] = ser((select(i, ...))) end
-	return table.concat(parts, " | ")
-end
-
--- ============================================================
--- HEADER
--- ============================================================
-log(("===== MACHINA RECON FULL  %s ====="):format(os.date("%Y-%m-%d %H:%M:%S")))
-log(("PlaceId: %d   JobId: %s"):format(game.PlaceId, game.JobId or ""))
-log(("Player:  %s (uid %d)"):format(LocalPlayer.Name, LocalPlayer.UserId))
-log(("Exec features: writefile=%s decompile=%s getscripts=%s getloaded=%s"):format(
-	tostring(_writefile ~= nil), tostring(_decompile ~= nil),
-	tostring(_getscripts ~= nil), tostring(_getloaded ~= nil)))
-flush()
-
--- ============================================================
--- 1. REMOTE INVENTORY
--- ============================================================
-banner("1. REMOTE INVENTORY")
-
-local function dumpRemotes(parent, label)
-	section("Remotes in " .. label)
-	local count, flagged = 0, 0
-	for _, d in ipairs(parent:GetDescendants()) do
-		if d:IsA("RemoteEvent") or d:IsA("RemoteFunction")
-			or d:IsA("BindableEvent") or d:IsA("BindableFunction")
-			or d:IsA("UnreliableRemoteEvent") then
-			count = count + 1
-			local mark = flag(d.Name) and "  *** FLAGGED ***" or ""
-			if mark ~= "" then flagged = flagged + 1 end
-			log(("[%s] %s%s"):format(d.ClassName, d:GetFullName(), mark))
-		end
-	end
-	log(("(total %d, flagged %d)"):format(count, flagged))
-end
-dumpRemotes(ReplicatedStorage, "ReplicatedStorage")
-pcall(function() dumpRemotes(game:GetService("ReplicatedFirst"), "ReplicatedFirst") end)
-pcall(function() dumpRemotes(workspace, "Workspace") end)
-flush()
-
--- ============================================================
--- 2. TOOL DUMP  (Backpack + StarterPack + Character)
--- ============================================================
-banner("2. TOOLS  (with full LocalScript source)")
-
-local function dumpTool(t, where)
-	section(("Tool [%s]  %s"):format(where, t.Name))
-	log("  Path: " .. t:GetFullName())
-	log("  Attributes:")
-	for k, v in pairs(t:GetAttributes()) do
-		log(("    @%s = %s"):format(k, ser(v)))
-	end
-	-- list everything inside
-	for _, child in ipairs(t:GetDescendants()) do
-		local cls = child.ClassName
-		if child:IsA("LocalScript") or child:IsA("ModuleScript") or child:IsA("Script") then
-			log(("  -- script: [%s] %s"):format(cls, child:GetFullName()))
-			dumpScriptSource(child, "    ")
-		elseif child:IsA("RemoteEvent") or child:IsA("RemoteFunction")
-			or child:IsA("BindableEvent") or child:IsA("BindableFunction") then
-			log(("  -- remote: [%s] %s"):format(cls, child:GetFullName()))
-		elseif child:IsA("ValueBase") then
-			local ok, val = pcall(function() return child.Value end)
-			log(("  -- value:  [%s] %s = %s"):format(cls, child.Name, ok and ser(val) or "?"))
-		elseif child:IsA("BasePart") or child:IsA("Folder") or child:IsA("Configuration") then
-			log(("  -- %s: %s"):format(cls, child.Name))
-		end
-	end
-end
-
-local function dumpToolsIn(parent, label)
-	if not parent then return end
-	for _, c in ipairs(parent:GetChildren()) do
-		if c:IsA("Tool") then dumpTool(c, label) end
-	end
-end
-dumpToolsIn(LocalPlayer:FindFirstChild("Backpack"), "Backpack")
-dumpToolsIn(StarterPack, "StarterPack")
-if LocalPlayer.Character then dumpToolsIn(LocalPlayer.Character, "Character") end
-flush()
-
--- ============================================================
--- 3. PLAYERGUI  (Auto button lives here)
--- ============================================================
-banner("3. PlayerGui ScreenGuis  (with script source)")
-
-for _, g in ipairs(PlayerGui:GetChildren()) do
-	if g:IsA("ScreenGui") or g:IsA("Frame") then
-		section(("ScreenGui: %s"):format(g.Name))
-		log("  Path: " .. g:GetFullName())
-		for _, d in ipairs(g:GetDescendants()) do
-			if d:IsA("LocalScript") or d:IsA("ModuleScript") or d:IsA("Script") then
-				log(("  -- script: [%s] %s"):format(d.ClassName, d:GetFullName()))
-				dumpScriptSource(d, "    ")
-			elseif d:IsA("TextButton") or d:IsA("ImageButton") then
-				local txt = d:IsA("TextButton") and tostring(d.Text) or ""
-				if flag(d.Name) or flag(txt) then
-					log(("  -- button *** %s   text=%q  path=%s"):format(d.ClassName, txt, d:GetFullName()))
-				end
-			end
-		end
-	end
-end
-flush()
-
--- ============================================================
--- 4. MINING-RELATED MODULESCRIPTS  (ReplicatedStorage + loaded)
--- ============================================================
-banner("4. Mining-related ModuleScripts (source decompiled)")
-
-local seenSrc = {}
-
-local function dumpModuleIfRelevant(m, why)
-	if seenSrc[m] then return end
-	seenSrc[m] = true
-	if not (m:IsA("ModuleScript") or m:IsA("LocalScript") or m:IsA("Script")) then return end
-	local path = m:GetFullName()
-	if not (flag(m.Name) or flag(path)) then return end
-	section(("[%s]  %s   (matched: %s)"):format(m.ClassName, path, why))
-	dumpScriptSource(m, "  ")
-end
-
--- ReplicatedStorage descendants
-for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
-	dumpModuleIfRelevant(d, "ReplicatedStorage")
-end
-
--- StarterPlayerScripts / StarterCharacterScripts
-pcall(function()
-	for _, d in ipairs(StarterPlayer:GetDescendants()) do
-		dumpModuleIfRelevant(d, "StarterPlayer")
-	end
-end)
-
--- PlayerScripts
-pcall(function()
-	local ps = LocalPlayer:FindFirstChild("PlayerScripts")
-	if ps then
-		for _, d in ipairs(ps:GetDescendants()) do
-			dumpModuleIfRelevant(d, "PlayerScripts")
-		end
-	end
-end)
-
--- Loaded modules (catches ones loaded at runtime from non-obvious paths)
-if _getloaded then
-	for _, m in ipairs(_getloaded()) do
-		dumpModuleIfRelevant(m, "loaded-modules")
-	end
-end
-
--- Scripts (loaded LocalScripts/Scripts)
-if _getscripts then
-	for _, m in ipairs(_getscripts()) do
-		dumpModuleIfRelevant(m, "all-scripts")
-	end
-end
-
-flush()
-
--- ============================================================
--- 5. LIVE FIRE/INVOKE LOG  (namecall hook)
--- ============================================================
-banner("5. LIVE FIRE/INVOKE LOG")
-log("(Use the marker buttons to label sections of this log.)")
-log("")
-
-local fireCount, markCount = 0, 0
-
-local function appendFireLine(self, method, ...)
-	fireCount = fireCount + 1
-	pcall(function()
-		log(("[FIRE #%d] %s :%s(%s)"):format(
-			fireCount, self:GetFullName(), method, serArgs(...)))
-	end)
-end
-
-local function installHook()
-	local ok, mt = pcall(getrawmetatable, game)
-	if not ok or not mt then
-		log("!! getrawmetatable failed — no live log available")
-		return false
-	end
-	local setRO = setreadonly or make_writeable
-	local isRO  = isreadonly  or function() return true end
-	local newcc = newcclosure or function(f) return f end
-	if isRO(mt) then pcall(setRO, mt, false) end
-
-	local oldNC = mt.__namecall
-	mt.__namecall = newcc(function(self, ...)
-		local method = getnamecallmethod and getnamecallmethod() or ""
-		if method == "FireServer" or method == "InvokeServer"
-			or method == "fireServer" or method == "invokeServer" then
-			appendFireLine(self, method, ...)
-		end
-		return oldNC(self, ...)
-	end)
-	pcall(setRO, mt, true)
-	return true
-end
-
-if installHook() then
-	log("[Recon] Namecall hook installed.")
-else
-	log("[Recon] Could not install namecall hook.")
-end
-flush()
-
--- ============================================================
--- 6. MARKER UI
--- ============================================================
 local C = {
-	BG   = Color3.fromRGB(14, 19, 33),
-	DEEP = Color3.fromRGB(5, 8, 16),
-	CARD = Color3.fromRGB(22, 30, 50),
-	TXT  = Color3.fromRGB(240, 245, 255),
-	DIM  = Color3.fromRGB(135, 155, 185),
-	PINK = Color3.fromRGB(245, 90, 165),
-	OK   = Color3.fromRGB(80, 195, 130),
-	WARN = Color3.fromRGB(235, 175, 75),
-	BLUE = Color3.fromRGB(80, 150, 235),
+	BG=Color3.fromRGB(14,19,33), DEEP=Color3.fromRGB(5,8,16),
+	CARD=Color3.fromRGB(22,30,50), TXT=Color3.fromRGB(240,245,255),
+	DIM=Color3.fromRGB(135,155,185), PINK=Color3.fromRGB(245,90,165),
+	OK=Color3.fromRGB(80,195,130), WARN=Color3.fromRGB(235,175,75),
+	BLUE=Color3.fromRGB(80,150,235), PURPLE=Color3.fromRGB(120,80,200),
 }
+local function corner(o,r) local c=Instance.new("UICorner") c.CornerRadius=UDim.new(0,r or 6) c.Parent=o end
+local function stroke(o,col,t) local s=Instance.new("UIStroke") s.Color=col s.Thickness=t or 1 s.Parent=o end
 
-local function corner(o, r) local c = Instance.new("UICorner") c.CornerRadius = UDim.new(0, r or 6) c.Parent = o end
-local function stroke(o, col, t) local s = Instance.new("UIStroke") s.Color = col s.Thickness = t or 1 s.Parent = o end
+-- Nuke any previous instance of this GUI (handy when re-running)
+local old = PlayerGui:FindFirstChild("MachinaReconFull")
+if old then old:Destroy() end
 
 local gui = Instance.new("ScreenGui")
 gui.Name = "MachinaReconFull"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.DisplayOrder = 999
 gui.Parent = PlayerGui
 
 local root = Instance.new("Frame")
-root.Size = UDim2.new(0, 230, 0, 290)
-root.Position = UDim2.new(0, 16, 0.5, -145)
+root.Size = UDim2.new(0,240,0,330)
+root.Position = UDim2.new(0,16,0.5,-165)
 root.BackgroundColor3 = C.BG
 root.BorderSizePixel = 0
 root.Active = true
+root.ZIndex = 1000
 root.Parent = gui
-corner(root, 10); stroke(root, C.DEEP, 1)
+corner(root,10); stroke(root,C.DEEP,1)
 
 local titleBar = Instance.new("Frame")
-titleBar.Size = UDim2.new(1, 0, 0, 28)
+titleBar.Size = UDim2.new(1,0,0,30)
 titleBar.BackgroundColor3 = C.DEEP
 titleBar.BorderSizePixel = 0
+titleBar.ZIndex = 1001
 titleBar.Parent = root
-corner(titleBar, 10)
+corner(titleBar,10)
 local fix = Instance.new("Frame")
-fix.Size = UDim2.new(1, 0, 0, 12); fix.Position = UDim2.new(0, 0, 1, -12)
-fix.BackgroundColor3 = C.DEEP; fix.BorderSizePixel = 0; fix.Parent = titleBar
+fix.Size = UDim2.new(1,0,0,12); fix.Position = UDim2.new(0,0,1,-12)
+fix.BackgroundColor3 = C.DEEP; fix.BorderSizePixel = 0
+fix.ZIndex = 1001; fix.Parent = titleBar
 
 local stripe = Instance.new("Frame")
-stripe.Size = UDim2.new(0, 3, 1, -10); stripe.Position = UDim2.new(0, 8, 0, 5)
+stripe.Size = UDim2.new(0,3,1,-10); stripe.Position = UDim2.new(0,8,0,5)
 stripe.BackgroundColor3 = C.PINK; stripe.BorderSizePixel = 0
-stripe.Parent = titleBar; corner(stripe, 2)
+stripe.ZIndex = 1002; stripe.Parent = titleBar; corner(stripe,2)
 
-local tl = Instance.new("TextLabel")
-tl.Size = UDim2.new(1, -20, 1, 0); tl.Position = UDim2.new(0, 18, 0, 0)
-tl.BackgroundTransparency = 1; tl.Text = "RECON FULL"
-tl.Font = Enum.Font.GothamBlack; tl.TextSize = 12
-tl.TextColor3 = C.TXT; tl.TextXAlignment = Enum.TextXAlignment.Left
-tl.Parent = titleBar
+local titleLbl = Instance.new("TextLabel")
+titleLbl.Size = UDim2.new(1,-20,1,0); titleLbl.Position = UDim2.new(0,18,0,0)
+titleLbl.BackgroundTransparency = 1; titleLbl.Text = "RECON v2"
+titleLbl.Font = Enum.Font.GothamBlack; titleLbl.TextSize = 12
+titleLbl.TextColor3 = C.TXT; titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+titleLbl.ZIndex = 1002; titleLbl.Parent = titleBar
 
-local status = Instance.new("TextLabel")
-status.Size = UDim2.new(1, -16, 0, 28)
-status.Position = UDim2.new(0, 8, 0, 34)
-status.BackgroundColor3 = C.CARD; status.BorderSizePixel = 0
-status.Font = Enum.Font.Code; status.TextSize = 10
-status.TextColor3 = C.OK; status.Text = "  initializing..."
-status.TextXAlignment = Enum.TextXAlignment.Left; status.TextWrapped = true
-status.Parent = root; corner(status, 6)
+local progress = Instance.new("TextLabel")
+progress.Size = UDim2.new(1,-16,0,40)
+progress.Position = UDim2.new(0,8,0,36)
+progress.BackgroundColor3 = C.CARD; progress.BorderSizePixel = 0
+progress.Font = Enum.Font.Code; progress.TextSize = 10
+progress.TextColor3 = C.WARN
+progress.Text = "  starting dump..."
+progress.TextXAlignment = Enum.TextXAlignment.Left
+progress.TextYAlignment = Enum.TextYAlignment.Top
+progress.TextWrapped = true
+progress.ZIndex = 1001
+progress.Parent = root
+corner(progress,6)
+local progPad = Instance.new("UIPadding")
+progPad.PaddingTop = UDim.new(0,4); progPad.PaddingLeft = UDim.new(0,6)
+progPad.Parent = progress
 
-local function makeMarkButton(layoutY, label, tag, color)
+local markCount, fireCount = 0, 0
+
+local function makeMark(layoutY, label, tag, color)
 	local b = Instance.new("TextButton")
-	b.Size = UDim2.new(1, -16, 0, 30); b.Position = UDim2.new(0, 8, 0, layoutY)
+	b.Size = UDim2.new(1,-16,0,32); b.Position = UDim2.new(0,8,0,layoutY)
 	b.BackgroundColor3 = color; b.AutoButtonColor = false
 	b.Text = label; b.Font = Enum.Font.GothamBold
-	b.TextSize = 12; b.TextColor3 = C.TXT
-	b.Parent = root; corner(b, 6)
+	b.TextSize = 12; b.TextColor3 = C.TXT; b.ZIndex = 1001
+	b.Parent = root; corner(b,6)
 	b.MouseButton1Click:Connect(function()
 		markCount = markCount + 1
 		log("")
@@ -490,23 +179,23 @@ local function makeMarkButton(layoutY, label, tag, color)
 		log("")
 		flush()
 		local orig = b.Text
-		b.Text = "✓ now do: " .. tag
+		b.Text = "✓ NOW DO: " .. tag
 		task.delay(2.5, function() if b.Parent then b.Text = orig end end)
 	end)
 	return b
 end
 
-makeMarkButton(70,  "▸ MARK: MANUAL MINE",  "MANUAL_MINE", C.BLUE)
-makeMarkButton(106, "▸ MARK: AUTO ON",      "AUTO_ON",     C.PINK)
-makeMarkButton(142, "▸ MARK: AUTO OFF",     "AUTO_OFF",    C.WARN)
-makeMarkButton(178, "▸ MARK: SELL",         "SELL",        Color3.fromRGB(120, 80, 200))
+makeMark( 84, "▸ MARK: MANUAL MINE", "MANUAL_MINE", C.BLUE)
+makeMark(120, "▸ MARK: AUTO ON",     "AUTO_ON",     C.PINK)
+makeMark(156, "▸ MARK: AUTO OFF",    "AUTO_OFF",    C.WARN)
+makeMark(192, "▸ MARK: SELL",        "SELL",        C.PURPLE)
 
 local saveBtn = Instance.new("TextButton")
-saveBtn.Size = UDim2.new(0.5, -10, 0, 32); saveBtn.Position = UDim2.new(0, 8, 0, 220)
+saveBtn.Size = UDim2.new(0.5,-10,0,32); saveBtn.Position = UDim2.new(0,8,0,234)
 saveBtn.BackgroundColor3 = C.OK; saveBtn.AutoButtonColor = false
 saveBtn.Text = "SAVE"; saveBtn.Font = Enum.Font.GothamBlack
-saveBtn.TextSize = 12; saveBtn.TextColor3 = C.TXT
-saveBtn.Parent = root; corner(saveBtn, 6)
+saveBtn.TextSize = 12; saveBtn.TextColor3 = C.TXT; saveBtn.ZIndex = 1001
+saveBtn.Parent = root; corner(saveBtn,6)
 saveBtn.MouseButton1Click:Connect(function()
 	flush()
 	saveBtn.Text = "SAVED ✓"
@@ -514,20 +203,21 @@ saveBtn.MouseButton1Click:Connect(function()
 end)
 
 local hideBtn = Instance.new("TextButton")
-hideBtn.Size = UDim2.new(0.5, -10, 0, 32); hideBtn.Position = UDim2.new(0.5, 2, 0, 220)
+hideBtn.Size = UDim2.new(0.5,-10,0,32); hideBtn.Position = UDim2.new(0.5,2,0,234)
 hideBtn.BackgroundColor3 = C.CARD; hideBtn.AutoButtonColor = false
 hideBtn.Text = "HIDE"; hideBtn.Font = Enum.Font.GothamBold
-hideBtn.TextSize = 12; hideBtn.TextColor3 = C.TXT
-hideBtn.Parent = root; corner(hideBtn, 6)
+hideBtn.TextSize = 12; hideBtn.TextColor3 = C.TXT; hideBtn.ZIndex = 1001
+hideBtn.Parent = root; corner(hideBtn,6)
 
 local hint = Instance.new("TextLabel")
-hint.Size = UDim2.new(1, -16, 0, 26); hint.Position = UDim2.new(0, 8, 0, 258)
+hint.Size = UDim2.new(1,-16,0,60); hint.Position = UDim2.new(0,8,0,272)
 hint.BackgroundTransparency = 1
-hint.Text = "Tap a MARK then do the action.\nMine → AutoOn → wait → AutoOff → Sell."
+hint.Text = "1. Manual Mine → mine one block\n2. Auto ON → tap relic Auto\n3. Wait 10s\n4. Auto OFF / Sell"
 hint.Font = Enum.Font.Code; hint.TextSize = 9
 hint.TextColor3 = C.DIM; hint.TextWrapped = true
 hint.TextXAlignment = Enum.TextXAlignment.Left
-hint.Parent = root
+hint.TextYAlignment = Enum.TextYAlignment.Top
+hint.ZIndex = 1001; hint.Parent = root
 
 -- Drag
 do
@@ -551,37 +241,269 @@ do
 	end)
 end
 
--- Hide / Show via bubble
+-- Bubble
 local bubble = Instance.new("TextButton")
-bubble.Size = UDim2.new(0, 50, 0, 50); bubble.Position = UDim2.new(0, 16, 0, 16)
+bubble.Size = UDim2.new(0,50,0,50); bubble.Position = UDim2.new(0,16,0,16)
 bubble.BackgroundColor3 = C.PINK; bubble.AutoButtonColor = false
 bubble.Text = "R"; bubble.Font = Enum.Font.GothamBlack
 bubble.TextSize = 18; bubble.TextColor3 = C.TXT
-bubble.Visible = false; bubble.ZIndex = 100; bubble.Parent = gui
+bubble.Visible = false; bubble.ZIndex = 1100; bubble.Parent = gui
 do
-	local c = Instance.new("UICorner") c.CornerRadius = UDim.new(1, 0) c.Parent = bubble
+	local c = Instance.new("UICorner") c.CornerRadius = UDim.new(1,0) c.Parent = bubble
 	local s = Instance.new("UIStroke") s.Color = C.TXT s.Thickness = 2 s.Parent = bubble
 end
-hideBtn.MouseButton1Click:Connect(function()
-	root.Visible = false; bubble.Visible = true
-end)
-bubble.MouseButton1Click:Connect(function()
-	root.Visible = true; bubble.Visible = false
+hideBtn.MouseButton1Click:Connect(function() root.Visible = false; bubble.Visible = true end)
+bubble.MouseButton1Click:Connect(function() root.Visible = true; bubble.Visible = false end)
+
+local function setProgress(txt)
+	if progress.Parent then progress.Text = "  " .. txt end
+	print("[Recon] " .. txt)
+end
+
+setProgress("UI ready · installing hook...")
+
+-- ============================================================
+-- NAMECALL HOOK (install before dump so we catch boot-time fires)
+-- ============================================================
+local function ser(v,d)
+	d = d or 0; if d > 3 then return "<deep>" end
+	local t = typeof(v)
+	if t == "Instance" then
+		local cls,fn = "?","?"
+		pcall(function() cls = v.ClassName end)
+		pcall(function() fn = v:GetFullName() end)
+		return ("<%s:%s>"):format(cls,fn)
+	elseif t=="Vector3" then return ("V3(%.1f,%.1f,%.1f)"):format(v.X,v.Y,v.Z)
+	elseif t=="Vector2" then return ("V2(%.1f,%.1f)"):format(v.X,v.Y)
+	elseif t=="CFrame" then local p=v.Position return ("CF(%.1f,%.1f,%.1f)"):format(p.X,p.Y,p.Z)
+	elseif t=="Color3" then return ("C3(%d,%d,%d)"):format(v.R*255,v.G*255,v.B*255)
+	elseif t=="EnumItem" then return tostring(v)
+	elseif t=="string" then return ("%q"):format(v)
+	elseif t=="number" or t=="boolean" or t=="nil" then return tostring(v)
+	elseif t=="table" then
+		local p,n = {},0
+		for k,vv in pairs(v) do
+			n=n+1; if n>16 then table.insert(p,"...") break end
+			table.insert(p, ("[%s]=%s"):format(ser(k,d+1), ser(vv,d+1)))
+		end
+		return "{"..table.concat(p,", ").."}"
+	end
+	return ("<%s>"):format(t)
+end
+local function serArgs(...)
+	local n,p = select("#",...), {}
+	for i=1,n do p[i] = ser((select(i,...))) end
+	return table.concat(p," | ")
+end
+
+pcall(function()
+	local mt = getrawmetatable(game)
+	local setRO = setreadonly or make_writeable
+	local isRO  = isreadonly  or function() return true end
+	local newcc = newcclosure or function(f) return f end
+	if isRO(mt) then pcall(setRO, mt, false) end
+	local oldNC = mt.__namecall
+	mt.__namecall = newcc(function(self, ...)
+		local method = getnamecallmethod and getnamecallmethod() or ""
+		if method == "FireServer" or method == "InvokeServer" then
+			fireCount = fireCount + 1
+			pcall(function()
+				log(("[FIRE #%d] %s :%s(%s)"):format(
+					fireCount, self:GetFullName(), method, serArgs(...)))
+			end)
+		end
+		return oldNC(self, ...)
+	end)
+	pcall(setRO, mt, true)
 end)
 
--- live status
+setProgress("hook installed · dumping starts now")
+
+-- ============================================================
+-- DUMP — runs in BACKGROUND task so UI stays responsive
+-- ============================================================
+local function flagged(s)
+	if type(s) ~= "string" then return false end
+	local low = s:lower()
+	for _, k in ipairs(KEYWORDS) do
+		if low:find(k, 1, true) then return true end
+	end
+	return false
+end
+
+local function tryDecompile(s)
+	if not _decompile then return nil, "no-decompile" end
+	local done, src, err = false, nil, nil
+	task.spawn(function()
+		local ok, res = pcall(_decompile, s)
+		if ok then src = res else err = tostring(res) end
+		done = true
+	end)
+	local t0 = tick()
+	while not done and (tick() - t0) < DECOMPILE_TIME do task.wait(0.05) end
+	if not done then return nil, "timeout" end
+	if not src or src == "" then return nil, err or "empty" end
+	if #src > MAX_SRC_BYTES then
+		src = src:sub(1, MAX_SRC_BYTES) .. "\n-- [TRUNCATED] --"
+	end
+	return src
+end
+
+local function logSrc(s, indent)
+	indent = indent or ""
+	local src, err = tryDecompile(s)
+	if not src then
+		log(indent .. "  -- <decompile failed: " .. tostring(err) .. ">")
+		return
+	end
+	log(indent .. "  >>>>>>> SOURCE >>>>>>>")
+	for line in src:gmatch("([^\n]*)\n?") do log(indent .. line) end
+	log(indent .. "  <<<<<<< END SOURCE <<<<<<<")
+end
+
 task.spawn(function()
+	pcall(function()
+		log(("===== MACHINA RECON v2  %s ====="):format(os.date("%Y-%m-%d %H:%M:%S")))
+		log(("PlaceId: %d   JobId: %s"):format(game.PlaceId, game.JobId or ""))
+		log(("Player:  %s (uid %d)"):format(LocalPlayer.Name, LocalPlayer.UserId))
+		log("")
+		flush()
+
+		-- 1. REMOTES
+		setProgress("[1/4] remote inventory...")
+		log(""); log("################ 1. REMOTES ################")
+		local function dumpRemotes(parent, label)
+			log(""); log("----- " .. label .. " -----")
+			local n, fl = 0, 0
+			for _, d in ipairs(parent:GetDescendants()) do
+				if d:IsA("RemoteEvent") or d:IsA("RemoteFunction")
+					or d:IsA("BindableEvent") or d:IsA("BindableFunction")
+					or d:IsA("UnreliableRemoteEvent") then
+					n = n + 1
+					local mk = flagged(d.Name) and "  *** FLAGGED ***" or ""
+					if mk ~= "" then fl = fl + 1 end
+					log(("[%s] %s%s"):format(d.ClassName, d:GetFullName(), mk))
+				end
+			end
+			log(("(total %d · flagged %d)"):format(n, fl))
+		end
+		pcall(dumpRemotes, ReplicatedStorage, "ReplicatedStorage")
+		pcall(function() dumpRemotes(game:GetService("ReplicatedFirst"), "ReplicatedFirst") end)
+		pcall(function() dumpRemotes(workspace, "Workspace") end)
+		flush()
+
+		-- 2. TOOLS
+		setProgress("[2/4] tools (decompiling)...")
+		log(""); log("################ 2. TOOLS ################")
+		local function dumpTool(t, where)
+			log(""); log(("----- Tool [%s] %s -----"):format(where, t.Name))
+			log("Path: " .. t:GetFullName())
+			for k, v in pairs(t:GetAttributes()) do
+				log(("  @%s = %s"):format(k, ser(v)))
+			end
+			for _, child in ipairs(t:GetDescendants()) do
+				local cls = child.ClassName
+				if child:IsA("LocalScript") or child:IsA("ModuleScript") or child:IsA("Script") then
+					log(("-- script: [%s] %s"):format(cls, child:GetFullName()))
+					pcall(logSrc, child, "  ")
+				elseif child:IsA("RemoteEvent") or child:IsA("RemoteFunction")
+					or child:IsA("BindableEvent") or child:IsA("BindableFunction") then
+					log(("-- remote: [%s] %s"):format(cls, child:GetFullName()))
+				end
+			end
+		end
+		local function dumpToolsIn(parent, label)
+			if not parent then return end
+			for _, c in ipairs(parent:GetChildren()) do
+				if c:IsA("Tool") then pcall(dumpTool, c, label) end
+			end
+		end
+		dumpToolsIn(LocalPlayer:FindFirstChild("Backpack"), "Backpack")
+		dumpToolsIn(StarterPack, "StarterPack")
+		if LocalPlayer.Character then dumpToolsIn(LocalPlayer.Character, "Character") end
+		flush()
+
+		-- 3. PLAYERGUI
+		setProgress("[3/4] PlayerGui scripts...")
+		log(""); log("################ 3. PLAYERGUI ################")
+		for _, gnode in ipairs(PlayerGui:GetChildren()) do
+			if gnode.Name == "MachinaReconFull" then continue end
+			if gnode:IsA("ScreenGui") or gnode:IsA("Frame") then
+				pcall(function()
+					log(""); log(("----- ScreenGui: %s -----"):format(gnode.Name))
+					log("Path: " .. gnode:GetFullName())
+					for _, d in ipairs(gnode:GetDescendants()) do
+						if d:IsA("LocalScript") or d:IsA("ModuleScript") or d:IsA("Script") then
+							log(("-- script: [%s] %s"):format(d.ClassName, d:GetFullName()))
+							pcall(logSrc, d, "  ")
+						elseif d:IsA("TextButton") or d:IsA("ImageButton") then
+							local txt = d:IsA("TextButton") and tostring(d.Text) or ""
+							if flagged(d.Name) or flagged(txt) then
+								log(("-- button *** [%s] text=%q  %s"):format(d.ClassName, txt, d:GetFullName()))
+							end
+						end
+					end
+				end)
+			end
+		end
+		flush()
+
+		-- 4. MODULES
+		setProgress("[4/4] mining modules...")
+		log(""); log("################ 4. MINING MODULES ################")
+		local seen = {}
+		local dumpedCount = 0
+		local function maybe(m, why)
+			if dumpedCount >= MAX_MODULES then return end
+			if seen[m] then return end; seen[m] = true
+			if not (m:IsA("ModuleScript") or m:IsA("LocalScript") or m:IsA("Script")) then return end
+			local path = ""
+			pcall(function() path = m:GetFullName() end)
+			if not (flagged(m.Name) or flagged(path)) then return end
+			dumpedCount = dumpedCount + 1
+			setProgress(("[4/4] mining modules... %d/%d"):format(dumpedCount, MAX_MODULES))
+			pcall(function()
+				log(""); log(("----- [%s] %s (%s) -----"):format(m.ClassName, path, why))
+				logSrc(m, "")
+			end)
+		end
+		pcall(function()
+			for _, d in ipairs(ReplicatedStorage:GetDescendants()) do maybe(d, "RS") end
+		end)
+		pcall(function()
+			for _, d in ipairs(StarterPlayer:GetDescendants()) do maybe(d, "StarterPlayer") end
+		end)
+		pcall(function()
+			local ps = LocalPlayer:FindFirstChild("PlayerScripts")
+			if ps then for _, d in ipairs(ps:GetDescendants()) do maybe(d, "PlayerScripts") end end
+		end)
+		if _getloaded then
+			pcall(function()
+				for _, m in ipairs(_getloaded()) do maybe(m, "loaded") end
+			end)
+		end
+		if _getscripts then
+			pcall(function()
+				for _, m in ipairs(_getscripts()) do maybe(m, "scripts") end
+			end)
+		end
+		flush()
+
+		log(""); log("################ READY — USE THE MARKER BUTTONS ################")
+		flush()
+		setProgress(("READY · %d fires logged"):format(fireCount))
+	end)
+end)
+
+-- live status updater (overrides setProgress once dump finishes)
+task.spawn(function()
+	local lastTxt = ""
 	while true do
 		task.wait(0.4)
-		if status.Parent then
-			status.Text = ("  hook on · %d fires · %d marks"):format(fireCount, markCount)
+		if progress.Parent and progress.Text:find("READY") then
+			progress.Text = ("  READY · %d fires · %d marks"):format(fireCount, markCount)
 		end
 	end
 end)
 
--- ============================================================
--- READY
--- ============================================================
-banner("READY — start tapping markers and performing actions")
-flush()
-print("[MachinaReconFull] writing to:", OUT_FILE)
+print("[Recon] script fully loaded. UI should be visible at top-left.")
