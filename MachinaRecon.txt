@@ -1,23 +1,30 @@
 --!nocheck
 -- ============================================================
--- MACHINA RECON v18  —  TUNED FOR REALITY
+-- MACHINA DEBUG CONSOLE v19
 -- Branch: claude/rare-indicator-auto-aim-mC8LF
--- File:   MachinaRecon.txt
+-- File:   MachinaRecon.txt  (same URL)
 --
--- WHAT WE PROVED IN v17:
---   - Bulk buffer:     0 mines  (server reads 1 block per call)
---   - DataEvent:       0 mines  (mining only goes through RemoteEvent)
---   - Probe of 15 alt cmds: 0 mines (no hidden mining commands)
+-- Scrap of the slot-machine UI. This is a proper console:
+--   • Tap a snippet to run it
+--   • Or type custom Lua in the input box and Run
+--   • Toggle SNIFFER to capture every FireServer with full args
+--   • Output console at the bottom shows everything
 --
--- WHAT WE FOUND:
---   - Single mode mined 47/sec at peak (20 fires/sec × 2.35 AOE)
---   - Burst lasts ~5 sec then server throttles to 0
---   - Long pause (~30+ sec) refills the budget
---
--- v18 OPTIMIZES THE PROVEN PATTERN:
---   1. Auto-pulse: 5 sec ON → 2 sec OFF cycle (preserves burst budget)
---   2. Auto-walk: small CFrame nudge to enter new block clusters
---   3. Tuned defaults from your best-performing v17 settings
+-- Exposed in snippet/custom env:
+--   R    = ReplicatedStorage.RemoteEvent
+--   DE   = ReplicatedStorage.DataEvent
+--   RS   = ReplicatedStorage
+--   WS   = Workspace
+--   LP   = LocalPlayer
+--   HRP  = HumanoidRootPart (or nil)
+--   CHAR = Character (or nil)
+--   NONCE = "\xFF\xFF\xFF\xFF" magic nonce
+--   dprint(...)  = print to console (NOT game print — game hooks print!)
+--   dump(v)      = pretty-print any value
+--   rnonce()     = fresh random 4-byte nonce
+--   mineBuf(x,y,z,dmg) = build a 32-byte mining buffer
+--   fireMine(x,y,z,dmg) = full fire of DamageBlockSmooth
+--   nearest()    = position of nearest CollisionPart to player
 -- ============================================================
 
 local Players          = game:GetService("Players")
@@ -27,15 +34,15 @@ local Workspace        = game:GetService("Workspace")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
 
-local OUT_FILE       = "MachinaRecon.txt"
-local MAGIC_NONCE    = string.char(255,255,255,255)
-local RE             = ReplicatedStorage:WaitForChild("RemoteEvent")
-local ORIGIN         = Vector3.new(12000, 12000, 12000)
-local BLOCK_SIZE     = 6
-local MINE_PROXIMITY = 40
+local OUT_FILE = "MachinaRecon.txt"
+local ORIGIN    = Vector3.new(12000, 12000, 12000)
+local BLOCK_SIZE = 6
+local MAGIC_NONCE = string.char(255,255,255,255)
+local R  = ReplicatedStorage:WaitForChild("RemoteEvent")
+local DE = ReplicatedStorage:FindFirstChild("DataEvent")
 
 -- ============================================================
--- ENV / LOG
+-- ENV
 -- ============================================================
 local function find(n)
 	local v = rawget(_G, n); if v then return v end
@@ -45,207 +52,308 @@ local function find(n)
 end
 local _writefile = find("writefile")
 
-local LOG = {}
+-- ============================================================
+-- OUTPUT CAPTURE  (we never call game's print — anti-cheat reads it)
+-- ============================================================
+local OUTPUT = {}
+local OUT_MAX = 400
 local function tstamp() return os.date("%H:%M:%S") end
-local function log(msg)
-	table.insert(LOG, ("[%s] %s"):format(tstamp(), tostring(msg)))
-	if #LOG > 250 then table.remove(LOG, 1) end
+local function dprint(...)
+	local n = select("#", ...)
+	local parts = {}
+	for i = 1, n do parts[i] = tostring((select(i, ...))) end
+	table.insert(OUTPUT, ("[%s] %s"):format(tstamp(), table.concat(parts, " ")))
+	if #OUTPUT > OUT_MAX then table.remove(OUTPUT, 1) end
 end
 
 -- ============================================================
--- REMOTE / BUFFER
+-- HELPERS exposed to snippets
 -- ============================================================
-local function snap(c, origin) return math.floor((c - origin) / BLOCK_SIZE + 0.5) * BLOCK_SIZE + origin end
-local function makeMineBuffer(wx, wy, wz, damage)
-	local b = buffer.create(32)
-	buffer.writef64(b, 0,  (snap(wz, ORIGIN.Z) - ORIGIN.Z) / BLOCK_SIZE)
-	buffer.writef64(b, 8,  (snap(wy, ORIGIN.Y) - ORIGIN.Y) / BLOCK_SIZE)
-	buffer.writef64(b, 16, (snap(wx, ORIGIN.X) - ORIGIN.X) / BLOCK_SIZE)
-	buffer.writef64(b, 24, damage)
-	return b
+local function dump(v, depth)
+	depth = depth or 0
+	if depth > 3 then return "<deep>" end
+	local t = typeof(v)
+	if t == "Instance" then
+		local fn = "?"; pcall(function() fn = v:GetFullName() end)
+		return ("<%s:%s>"):format(v.ClassName, fn)
+	elseif t == "Vector3" then return ("V3(%.1f,%.1f,%.1f)"):format(v.X, v.Y, v.Z)
+	elseif t == "CFrame" then local p=v.Position; return ("CF(%.1f,%.1f,%.1f)"):format(p.X,p.Y,p.Z)
+	elseif t == "buffer" then
+		local ok, raw = pcall(buffer.tostring, v)
+		if ok then
+			local hex = {}
+			local lim = math.min(#raw, 48)
+			for i = 1, lim do hex[i] = string.format("%02x", string.byte(raw, i)) end
+			return ("buf(%d) %s%s"):format(#raw, table.concat(hex, " "),
+				#raw > lim and " ...+"..(#raw-lim) or "")
+		end
+		return "buf<?>"
+	elseif t == "string" then return ('"%s"'):format(v:sub(1, 50))
+	elseif t == "table" then
+		local parts, n = {}, 0
+		for k, vv in pairs(v) do
+			n = n + 1
+			if n > 12 then table.insert(parts, "..."); break end
+			table.insert(parts, ("[%s]=%s"):format(tostring(k), dump(vv, depth+1)))
+		end
+		return "{" .. table.concat(parts, ", ") .. "}"
+	end
+	return tostring(v)
 end
-local function randomNonce()
+
+local function rnonce()
 	return string.char(math.random(0,255), math.random(0,255), math.random(0,255), math.random(0,255))
 end
-local function fireMine(x, y, z, dmg)
-	pcall(function() RE:FireServer(randomNonce(), "DamageBlockSmooth", makeMineBuffer(x, y, z, dmg)) end)
-end
-local function setMineMode(on)
-	pcall(function() RE:FireServer(MAGIC_NONCE, "SetMode", on and "Mine" or "None") end)
-end
 
--- ============================================================
--- TARGETS
--- ============================================================
-local function collectTargets(playerPos, radius)
-	local r2 = radius * radius
-	local seen, result = {}, {}
-	local function tryAdd(part)
-		if not part:IsA("BasePart") then return end
-		local p = part.Position
-		local dp = p - playerPos
-		local d2 = dp.X*dp.X + dp.Y*dp.Y + dp.Z*dp.Z
-		if d2 > r2 then return end
-		local kx = math.floor((p.X - ORIGIN.X) / BLOCK_SIZE + 0.5)
-		local ky = math.floor((p.Y - ORIGIN.Y) / BLOCK_SIZE + 0.5)
-		local kz = math.floor((p.Z - ORIGIN.Z) / BLOCK_SIZE + 0.5)
-		local key = kx .. "," .. ky .. "," .. kz
-		if seen[key] then return end
-		seen[key] = true
-		table.insert(result, {x=p.X, y=p.Y, z=p.Z, d2=d2})
-	end
+local function snapCoord(c, origin)
+	return math.floor((c - origin) / BLOCK_SIZE + 0.5) * BLOCK_SIZE + origin
+end
+local function mineBuf(wx, wy, wz, dmg)
+	local b = buffer.create(32)
+	buffer.writef64(b, 0,  (snapCoord(wz, ORIGIN.Z) - ORIGIN.Z) / BLOCK_SIZE)
+	buffer.writef64(b, 8,  (snapCoord(wy, ORIGIN.Y) - ORIGIN.Y) / BLOCK_SIZE)
+	buffer.writef64(b, 16, (snapCoord(wx, ORIGIN.X) - ORIGIN.X) / BLOCK_SIZE)
+	buffer.writef64(b, 24, dmg or 0.1)
+	return b
+end
+local function fireMine(x, y, z, dmg)
+	pcall(function() R:FireServer(rnonce(), "DamageBlockSmooth", mineBuf(x, y, z, dmg)) end)
+end
+local function nearest()
+	local char = LocalPlayer.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return nil end
 	local cp = Workspace:FindFirstChild("CollisionParts")
-	if cp then for _, d in ipairs(cp:GetChildren()) do tryAdd(d) end end
-	local bl = Workspace:FindFirstChild("Blocks")
-	if bl then
-		for _, child in ipairs(bl:GetChildren()) do
-			if child:IsA("BasePart") then tryAdd(child)
-			elseif child:IsA("Folder") or child:IsA("Model") then
-				for _, gc in ipairs(child:GetChildren()) do tryAdd(gc) end
-			end
+	if not cp then return nil end
+	local best, bd = nil, math.huge
+	for _, p in ipairs(cp:GetChildren()) do
+		if p:IsA("BasePart") then
+			local d = (p.Position - hrp.Position).Magnitude
+			if d < bd then bd = d; best = p end
 		end
 	end
-	table.sort(result, function(a, b) return a.d2 < b.d2 end)
-	return result
+	return best and best.Position or nil
 end
 
 -- ============================================================
--- STATE
+-- SNIFFER  (toggle to record every FireServer in OUTPUT)
 -- ============================================================
-local stats = {
-	radiusOn = false,
-	pulseMode = true,        -- auto burst/rest cycle
-	autoWalk = false,        -- micro-teleport for fresh chunks
-	burstSec = 5,
-	restSec = 2,
-	radius = 24,
-	maxTgts = 10,
-	rateHz = 25,
-	damage = 0.1,
-	totalFires = 0,
-	firesThisSec = 0,
-	firesPerSec = 0,
-	minedThisSec = 0,
-	minedPerSec = 0,
-	totalMined = 0,
-	targetsFound = 0,
-	rrIdx = 1,
-	pulsePhase = "rest",
-	bestMinedPerSec = 0,
+local sniffOn = false
+pcall(function()
+	local mt = getrawmetatable(game)
+	local setRO = setreadonly or make_writeable
+	local isRO  = isreadonly  or function() return true end
+	local newcc = newcclosure or function(f) return f end
+	if isRO(mt) then pcall(setRO, mt, false) end
+	local oldNC = mt.__namecall
+	mt.__namecall = newcc(function(self, ...)
+		if sniffOn then
+			local method = getnamecallmethod and getnamecallmethod() or ""
+			if method == "FireServer" or method == "InvokeServer" then
+				local n, parts = select("#", ...), {}
+				for i = 1, n do parts[i] = dump((select(i, ...))) end
+				pcall(function()
+					local path = self:GetFullName()
+					table.insert(OUTPUT, ("[%s] SNIFF %s:%s(%s)"):format(
+						tstamp(), path, method, table.concat(parts, ", ")))
+					if #OUTPUT > OUT_MAX then table.remove(OUTPUT, 1) end
+				end)
+			end
+		end
+		return oldNC(self, ...)
+	end)
+	pcall(setRO, mt, true)
+end)
+
+-- ============================================================
+-- SNIPPETS
+-- ============================================================
+local SNIPPETS = {
+	{
+		name = "1. List remotes",
+		code = [[
+local n = 0
+for _, d in ipairs(RS:GetDescendants()) do
+  if d:IsA("RemoteEvent") or d:IsA("RemoteFunction")
+     or d:IsA("BindableEvent") or d:IsA("BindableFunction") then
+    n = n + 1
+    dprint("  "..d.ClassName.."  "..d:GetFullName())
+  end
+end
+dprint("total = "..n)
+]]
+	},
+	{
+		name = "2. Try every SetMode value",
+		code = [[
+local modes = {"Mine","AutoMine","Place","Build","Bomb","Explosive",
+               "Jackhammer","Drill","Excavate","Trade","Sell","None"}
+for _, m in ipairs(modes) do
+  R:FireServer(NONCE, "SetMode", m)
+  dprint("SetMode -> "..m)
+  task.wait(0.15)
+end
+R:FireServer(NONCE, "SetMode", "None")
+dprint("done. flip SNIFFER ON next time to see if server reacts")
+]]
+	},
+	{
+		name = "3. Spin camera + AutoMine (globe)",
+		code = [[
+-- Idea: auto-mine fires in front of camera. Spin camera = mine in circle.
+R:FireServer(NONCE, "SetAutoMine", true)
+dprint("AutoMine ON; spinning camera 360 deg over 4s")
+local cam = WS.CurrentCamera
+local startCF = cam.CFrame
+for i = 1, 36 do
+  cam.CFrame = startCF * CFrame.Angles(0, math.rad(i * 10), 0)
+  task.wait(0.11)
+end
+cam.CFrame = startCF
+R:FireServer(NONCE, "SetAutoMine", false)
+dprint("done — check if more blocks mined than usual")
+]]
+	},
+	{
+		name = "4. Fire 100 DamageBlockSmooth in parallel",
+		code = [[
+local pos = nearest()
+if not pos then dprint("no nearby block"); return end
+dprint("burst-firing 100 at "..tostring(pos))
+local before = 0
+for i = 1, 100 do
+  task.spawn(function() fireMine(pos.X, pos.Y, pos.Z, 1) end)
+end
+task.wait(2)
+dprint("done — did the block break instantly?")
+]]
+	},
+	{
+		name = "5. Inspect Backpack tools + their scripts",
+		code = [[
+local bp = LP:FindFirstChild("Backpack")
+if not bp then dprint("no Backpack"); return end
+for _, t in ipairs(bp:GetChildren()) do
+  if t:IsA("Tool") then
+    dprint("Tool: "..t.Name)
+    dprint("  attrs: "..dump(t:GetAttributes()))
+    for _, c in ipairs(t:GetDescendants()) do
+      if c:IsA("RemoteEvent") or c:IsA("BindableEvent") then
+        dprint("  remote: "..c.ClassName.." "..c:GetFullName())
+      elseif c:IsA("LocalScript") then
+        dprint("  script: "..c:GetFullName())
+      end
+    end
+  end
+end
+]]
+	},
+	{
+		name = "6. Hook + dump AutoMine remote script env",
+		code = [[
+-- Find the local script that drives the Auto button in PlayerGui
+local am = LP.PlayerGui:FindFirstChild("Game")
+if am then am = am:FindFirstChild("AutoMine") end
+if am then
+  for _, c in ipairs(am:GetDescendants()) do
+    if c:IsA("LocalScript") then
+      dprint("AutoMine script: "..c:GetFullName())
+      local ok, env = pcall(getsenv, c)
+      if ok and env then
+        for k, v in pairs(env) do dprint("  "..k.." = "..dump(v)) end
+      else
+        dprint("  no getsenv access")
+      end
+    end
+  end
+else
+  dprint("no PlayerGui.Game.AutoMine")
+end
+]]
+	},
+	{
+		name = "7. Try BlockHandler module directly",
+		code = [[
+local ok, mod = pcall(require, RS.Modules.BlockHandler)
+if not ok then dprint("require failed: "..tostring(mod)); return end
+dprint("BlockHandler keys:")
+for k, v in pairs(mod) do dprint("  "..k.." = "..dump(v)) end
+]]
+	},
+	{
+		name = "8. Try DataEvent with various cmds",
+		code = [[
+if not DE then dprint("no DataEvent"); return end
+local cmds = {"SetMode","DamageBlockSmooth","Mine","Sell","Trade",
+              "Inventory","Save","Load","Sync"}
+local pos = nearest() or Vector3.new(0,0,0)
+for _, c in ipairs(cmds) do
+  pcall(function()
+    DE:FireServer(NONCE, c, mineBuf(pos.X, pos.Y, pos.Z, 0.1))
+  end)
+  dprint("DataEvent -> "..c)
+  task.wait(0.1)
+end
+]]
+	},
+	{
+		name = "9. Capture: use jackhammer/explosive now",
+		code = [[
+-- TURN ON SNIFFER below first, then run this.
+-- Then use your jackhammer ability or place an explosive.
+-- Sniffer will dump the exact remote args.
+dprint("Sniffer must be ON. Now use jackhammer/explosive in game.")
+dprint("Every FireServer will be logged here with command + args.")
+]]
+	},
+	{
+		name = "10. Mass-fire DamageBlock variant cmds",
+		code = [[
+-- Try every plausible variant of mining command names
+local pos = nearest()
+if not pos then dprint("no block nearby"); return end
+local cmds = {"DamageBlock","DamageBlockHard","DamageBlockSmooth",
+              "MineBlock","BreakBlock","HitBlock","ChunkDamage",
+              "AreaDamage","RadialDamage","Damage","Hit"}
+for _, c in ipairs(cmds) do
+  local before = 0
+  pcall(function()
+    R:FireServer(rnonce(), c, mineBuf(pos.X, pos.Y, pos.Z, 1))
+  end)
+  dprint("tried "..c)
+  task.wait(0.1)
+end
+dprint("watch for any blocks that just broke!")
+]]
+	},
 }
 
 -- ============================================================
--- MINE COUNTER
+-- RUN CODE (with our env)
 -- ============================================================
-local function attachWatcher(folder)
-	if not folder then return end
-	folder.DescendantRemoving:Connect(function(c)
-		if not c:IsA("BasePart") then return end
-		local char = LocalPlayer.Character
-		local hrp = char and char:FindFirstChild("HumanoidRootPart")
-		if not hrp then return end
-		local dp = c.Position - hrp.Position
-		if dp.X*dp.X + dp.Y*dp.Y + dp.Z*dp.Z <= MINE_PROXIMITY*MINE_PROXIMITY then
-			stats.minedThisSec = stats.minedThisSec + 1
-			stats.totalMined = stats.totalMined + 1
-		end
-	end)
+local function makeEnv()
+	local env = setmetatable({
+		dprint = dprint, dump = dump, rnonce = rnonce,
+		mineBuf = mineBuf, fireMine = fireMine, nearest = nearest,
+		R = R, DE = DE, RS = ReplicatedStorage, WS = Workspace,
+		LP = LocalPlayer,
+		CHAR = LocalPlayer.Character,
+		HRP = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart"),
+		NONCE = MAGIC_NONCE, ORIGIN = ORIGIN, BLOCK_SIZE = BLOCK_SIZE,
+	}, {__index = getfenv()})
+	return env
 end
-attachWatcher(Workspace:FindFirstChild("CollisionParts"))
-attachWatcher(Workspace:FindFirstChild("Blocks"))
-Workspace.ChildAdded:Connect(function(c)
-	if c.Name == "CollisionParts" or c.Name == "Blocks" then attachWatcher(c) end
-end)
 
--- Per-second tick
-task.spawn(function()
-	while true do
-		task.wait(1.0)
-		stats.minedPerSec = stats.minedThisSec; stats.minedThisSec = 0
-		stats.firesPerSec = stats.firesThisSec; stats.firesThisSec = 0
-		if stats.minedPerSec > stats.bestMinedPerSec then
-			stats.bestMinedPerSec = stats.minedPerSec
-		end
-		if stats.radiusOn then
-			local eff = stats.firesPerSec > 0 and (stats.minedPerSec / stats.firesPerSec) or 0
-			log(("%s tgts=%d f/s=%d MINED=%d  AOE=%.1fx  tot=%d"):format(
-				stats.pulsePhase=="burst" and "▶" or "·",
-				stats.targetsFound, stats.firesPerSec, stats.minedPerSec, eff, stats.totalMined))
-		end
-	end
-end)
-
--- ============================================================
--- PULSE LOOP — alternates SetMode Mine/None
--- ============================================================
-task.spawn(function()
-	while true do
-		if stats.radiusOn and stats.pulseMode then
-			stats.pulsePhase = "burst"
-			setMineMode(true)
-			task.wait(stats.burstSec)
-			stats.pulsePhase = "rest"
-			setMineMode(false)
-			task.wait(stats.restSec)
-		elseif stats.radiusOn then
-			stats.pulsePhase = "burst"  -- always burst when pulse off
-			task.wait(0.3)
-		else
-			stats.pulsePhase = "rest"
-			task.wait(0.2)
-		end
-	end
-end)
-
--- ============================================================
--- AUTO-WALK — small CFrame nudge to find fresh clusters
--- ============================================================
-task.spawn(function()
-	local angle = 0
-	while true do
-		task.wait(2.0)
-		if stats.radiusOn and stats.autoWalk then
-			local char = LocalPlayer.Character
-			local hrp = char and char:FindFirstChild("HumanoidRootPart")
-			if hrp then
-				angle = angle + math.pi / 3
-				local dx = math.cos(angle) * 6
-				local dz = math.sin(angle) * 6
-				pcall(function() hrp.CFrame = hrp.CFrame + Vector3.new(dx, 0, dz) end)
-			end
-		end
-	end
-end)
-
--- ============================================================
--- MINING LOOP — round-robin during burst
--- ============================================================
-task.spawn(function()
-	while true do
-		if stats.radiusOn and stats.pulsePhase == "burst" then
-			local char = LocalPlayer.Character
-			local hrp = char and char:FindFirstChild("HumanoidRootPart")
-			if hrp then
-				local targets = collectTargets(hrp.Position, stats.radius)
-				stats.targetsFound = #targets
-				if #targets > 0 then
-					local n = math.min(stats.maxTgts, #targets)
-					local idx = ((stats.rrIdx - 1) % n) + 1
-					stats.rrIdx = stats.rrIdx + 1
-					local t = targets[idx]
-					fireMine(t.x, t.y, t.z, stats.damage)
-					stats.totalFires = stats.totalFires + 1
-					stats.firesThisSec = stats.firesThisSec + 1
-				end
-			else
-				stats.targetsFound = 0
-			end
-			task.wait(1 / math.max(1, stats.rateHz))
-		else
-			task.wait(0.1)
-		end
-	end
-end)
+local function runCode(code)
+	local fn, err = loadstring(code, "console")
+	if not fn then dprint("PARSE ERR: " .. tostring(err)); return end
+	setfenv(fn, makeEnv())
+	dprint("--- running ---")
+	local ok, result = pcall(fn)
+	if not ok then dprint("RUN ERR: " .. tostring(result))
+	elseif result ~= nil then dprint("=> " .. dump(result)) end
+	dprint("--- done ---")
+end
 
 -- ============================================================
 -- UI
@@ -253,19 +361,19 @@ end)
 local C = {
 	BG=Color3.fromRGB(14,19,33), DEEP=Color3.fromRGB(5,8,16),
 	CARD=Color3.fromRGB(22,30,50), TXT=Color3.fromRGB(240,245,255),
-	DIM=Color3.fromRGB(135,155,185), PINK=Color3.fromRGB(245,90,165),
-	OK=Color3.fromRGB(80,195,130), WARN=Color3.fromRGB(235,175,75),
-	BLUE=Color3.fromRGB(80,150,235), RED=Color3.fromRGB(225,85,95),
-	GOLD=Color3.fromRGB(255,200,80),
+	DIM=Color3.fromRGB(135,155,185), GOLD=Color3.fromRGB(255,200,80),
+	OK=Color3.fromRGB(80,195,130), RED=Color3.fromRGB(225,85,95),
+	BLUE=Color3.fromRGB(80,150,235), WARN=Color3.fromRGB(235,175,75),
+	PURPLE=Color3.fromRGB(120,80,200),
 }
 local function corner(o,r) local c=Instance.new("UICorner") c.CornerRadius=UDim.new(0,r or 5) c.Parent=o end
 local function stroke(o,col,t) local s=Instance.new("UIStroke") s.Color=col s.Thickness=t or 1 s.Parent=o end
 
-local old = PlayerGui:FindFirstChild("MachinaReconV18")
+local old = PlayerGui:FindFirstChild("MachinaDebug19")
 if old then old:Destroy() end
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "MachinaReconV18"
+gui.Name = "MachinaDebug19"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -273,8 +381,8 @@ gui.DisplayOrder = 9999
 gui.Parent = PlayerGui
 
 local root = Instance.new("Frame")
-root.Size = UDim2.new(0, 230, 0, 380)
-root.Position = UDim2.new(0, 10, 0, 60)
+root.Size = UDim2.new(0, 280, 0, 480)
+root.Position = UDim2.new(0, 10, 0, 50)
 root.BackgroundColor3 = C.BG
 root.BorderSizePixel = 0
 root.Active = true
@@ -287,6 +395,7 @@ local function setZIndex(p, z)
 	for _, c in ipairs(p:GetChildren()) do setZIndex(c, z) end
 end
 
+-- Title
 local titleBar = Instance.new("Frame")
 titleBar.Size=UDim2.new(1,0,0,22); titleBar.BackgroundColor3=C.DEEP
 titleBar.BorderSizePixel=0; titleBar.Parent=root; corner(titleBar,7)
@@ -295,7 +404,7 @@ fix.Position=UDim2.new(0,0,1,-8); fix.BackgroundColor3=C.DEEP
 fix.BorderSizePixel=0; fix.Parent=titleBar
 local titleLbl=Instance.new("TextLabel"); titleLbl.Size=UDim2.new(1,-30,1,0)
 titleLbl.Position=UDim2.new(0,7,0,0); titleLbl.BackgroundTransparency=1
-titleLbl.Text="RECON v18 — TUNED"; titleLbl.Font=Enum.Font.GothamBlack
+titleLbl.Text="MACHINA DEBUG v19"; titleLbl.Font=Enum.Font.GothamBlack
 titleLbl.TextSize=10; titleLbl.TextColor3=C.GOLD
 titleLbl.TextXAlignment=Enum.TextXAlignment.Left; titleLbl.Parent=titleBar
 
@@ -306,147 +415,150 @@ hideBtn.Text="−"; hideBtn.Font=Enum.Font.GothamBlack
 hideBtn.TextSize=12; hideBtn.TextColor3=C.TXT
 hideBtn.Parent=titleBar; corner(hideBtn,3)
 
-local status=Instance.new("TextLabel")
-status.Size=UDim2.new(1,-10,0,44); status.Position=UDim2.new(0,5,0,25)
-status.BackgroundColor3=C.CARD; status.BorderSizePixel=0
-status.Font=Enum.Font.Code; status.TextSize=9; status.TextColor3=C.OK
-status.Text="  ready"; status.TextXAlignment=Enum.TextXAlignment.Left
-status.TextYAlignment=Enum.TextYAlignment.Top
-status.TextWrapped=true; status.Parent=root; corner(status,4)
-local sp=Instance.new("UIPadding"); sp.PaddingLeft=UDim.new(0,5); sp.PaddingTop=UDim.new(0,2); sp.Parent=status
-
-local rmBtn = Instance.new("TextButton")
-rmBtn.Size=UDim2.new(1,-10,0,28); rmBtn.Position=UDim2.new(0,5,0,72)
-rmBtn.BackgroundColor3=C.RED; rmBtn.AutoButtonColor=false
-rmBtn.Text="RADIUS MINE: OFF"; rmBtn.Font=Enum.Font.GothamBlack
-rmBtn.TextSize=11; rmBtn.TextColor3=C.TXT
-rmBtn.Parent=root; corner(rmBtn,5)
-rmBtn.MouseButton1Click:Connect(function()
-	stats.radiusOn = not stats.radiusOn
-	rmBtn.Text = stats.radiusOn and "RADIUS MINE: ON ✦" or "RADIUS MINE: OFF"
-	rmBtn.BackgroundColor3 = stats.radiusOn and C.OK or C.RED
-	if stats.radiusOn then setMineMode(true) else setMineMode(false) end
+-- Sniffer + Save row
+local sniffBtn = Instance.new("TextButton")
+sniffBtn.Size=UDim2.new(0.5,-7,0,22); sniffBtn.Position=UDim2.new(0,5,0,26)
+sniffBtn.BackgroundColor3=C.CARD; sniffBtn.AutoButtonColor=false
+sniffBtn.Text="🎧 Sniffer: OFF"; sniffBtn.Font=Enum.Font.GothamBold; sniffBtn.TextSize=9
+sniffBtn.TextColor3=C.TXT; sniffBtn.Parent=root; corner(sniffBtn,4)
+sniffBtn.MouseButton1Click:Connect(function()
+	sniffOn = not sniffOn
+	sniffBtn.Text = sniffOn and "🎧 Sniffer: ON" or "🎧 Sniffer: OFF"
+	sniffBtn.BackgroundColor3 = sniffOn and C.OK or C.CARD
+	dprint("sniffer " .. (sniffOn and "ON" or "OFF"))
 end)
 
--- Pulse toggle
-local pulseBtn = Instance.new("TextButton")
-pulseBtn.Size=UDim2.new(0.5,-7,0,22); pulseBtn.Position=UDim2.new(0,5,0,104)
-pulseBtn.BackgroundColor3=C.OK; pulseBtn.AutoButtonColor=false
-pulseBtn.Text="PULSE ON"; pulseBtn.Font=Enum.Font.GothamBold; pulseBtn.TextSize=9
-pulseBtn.TextColor3=C.TXT; pulseBtn.Parent=root; corner(pulseBtn,4)
-pulseBtn.MouseButton1Click:Connect(function()
-	stats.pulseMode = not stats.pulseMode
-	pulseBtn.Text = stats.pulseMode and "PULSE ON" or "PULSE OFF"
-	pulseBtn.BackgroundColor3 = stats.pulseMode and C.OK or C.CARD
-end)
-
--- AutoWalk toggle
-local walkBtn = Instance.new("TextButton")
-walkBtn.Size=UDim2.new(0.5,-7,0,22); walkBtn.Position=UDim2.new(0.5,2,0,104)
-walkBtn.BackgroundColor3=C.CARD; walkBtn.AutoButtonColor=false
-walkBtn.Text="AUTO-WALK OFF"; walkBtn.Font=Enum.Font.GothamBold; walkBtn.TextSize=9
-walkBtn.TextColor3=C.TXT; walkBtn.Parent=root; corner(walkBtn,4)
-walkBtn.MouseButton1Click:Connect(function()
-	stats.autoWalk = not stats.autoWalk
-	walkBtn.Text = stats.autoWalk and "AUTO-WALK ON" or "AUTO-WALK OFF"
-	walkBtn.BackgroundColor3 = stats.autoWalk and C.OK or C.CARD
-end)
-
-local function pillRow(y, label, values, getter, setter)
-	local lbl = Instance.new("TextLabel")
-	lbl.Size=UDim2.new(0,55,0,18); lbl.Position=UDim2.new(0,5,0,y)
-	lbl.BackgroundTransparency=1; lbl.Text=label
-	lbl.Font=Enum.Font.GothamBold; lbl.TextSize=8; lbl.TextColor3=C.DIM
-	lbl.TextXAlignment=Enum.TextXAlignment.Left; lbl.Parent=root
-	local boxes = {}
-	local total = 230 - 65
-	for i, v in ipairs(values) do
-		local pillW = (total / #values) - 3
-		local b = Instance.new("TextButton")
-		b.Size=UDim2.new(0,pillW,0,18)
-		b.Position=UDim2.new(0, 62+(i-1)*(pillW+3), 0, y)
-		b.BackgroundColor3 = (getter() == v) and C.BLUE or C.CARD
-		b.AutoButtonColor=false; b.Text=tostring(v); b.Font=Enum.Font.GothamBold
-		b.TextSize=8; b.TextColor3=C.TXT; b.Parent=root; corner(b,3)
-		b.MouseButton1Click:Connect(function()
-			setter(v)
-			for j, bb in ipairs(boxes) do
-				bb.BackgroundColor3 = (values[j] == v) and C.BLUE or C.CARD
-			end
-		end)
-		boxes[i] = b
-	end
-end
-
-pillRow(132, "Burst", {3,5,7,10},        function() return stats.burstSec end, function(v) stats.burstSec=v end)
-pillRow(154, "Rest",  {1,2,3,5},         function() return stats.restSec end,  function(v) stats.restSec=v end)
-pillRow(176, "Rad",   {12,18,24,36,50},  function() return stats.radius end,   function(v) stats.radius=v end)
-pillRow(198, "Pool",  {5,10,15,20},      function() return stats.maxTgts end,  function(v) stats.maxTgts=v end)
-pillRow(220, "Hz",    {15,25,40,60},     function() return stats.rateHz end,   function(v) stats.rateHz=v end)
-
-local function smallBtn(x, y, w, text, color, click)
-	local b = Instance.new("TextButton")
-	b.Size=UDim2.new(0,w,0,22); b.Position=UDim2.new(0,x,0,y)
-	b.BackgroundColor3=color; b.AutoButtonColor=false
-	b.Text=text; b.Font=Enum.Font.GothamBold; b.TextSize=9
-	b.TextColor3=C.TXT; b.Parent=root; corner(b,4)
-	b.MouseButton1Click:Connect(click)
-	return b
-end
-
-smallBtn(5, 244, 108, "★ AUTO ON", C.OK, function()
-	pcall(function() RE:FireServer(MAGIC_NONCE, "SetAutoMine", true) end)
-end)
-smallBtn(117, 244, 108, "■ AUTO OFF", C.RED, function()
-	pcall(function() RE:FireServer(MAGIC_NONCE, "SetAutoMine", false) end)
-end)
-
-local saveBtn = smallBtn(5, 268, 108, "💾 Save log", C.BLUE, function() end)
+local saveBtn = Instance.new("TextButton")
+saveBtn.Size=UDim2.new(0.5,-7,0,22); saveBtn.Position=UDim2.new(0.5,2,0,26)
+saveBtn.BackgroundColor3=C.BLUE; saveBtn.AutoButtonColor=false
+saveBtn.Text="💾 Save output"; saveBtn.Font=Enum.Font.GothamBold; saveBtn.TextSize=9
+saveBtn.TextColor3=C.TXT; saveBtn.Parent=root; corner(saveBtn,4)
 saveBtn.MouseButton1Click:Connect(function()
-	if not _writefile then saveBtn.Text="✗"; return end
-	local hdr = {
-		"===== RECON v18 LOG =====",
-		("Saved: %s"):format(os.date("%Y-%m-%d %H:%M:%S")),
-		("Player: %s"):format(LocalPlayer.Name),
-		("RM=%s pulse=%s walk=%s burst=%ss rest=%ss r=%d pool=%d hz=%d dmg=%s"):format(
-			stats.radiusOn and "ON" or "OFF",
-			stats.pulseMode and "ON" or "OFF",
-			stats.autoWalk and "ON" or "OFF",
-			stats.burstSec, stats.restSec, stats.radius,
-			stats.maxTgts, stats.rateHz, tostring(stats.damage)),
-		("fires=%d  mined=%d  best/s=%d"):format(
-			stats.totalFires, stats.totalMined, stats.bestMinedPerSec),
-		"",
-	}
-	local body = {}
-	for i, l in ipairs(LOG) do body[i] = l end
-	local payload = table.concat(hdr, "\n") .. table.concat(body, "\n")
+	if not _writefile then saveBtn.Text="✗ no fs"; return end
+	local payload = "===== MachinaDebug v19 =====\n" ..
+		("Saved: %s\n\n"):format(os.date("%Y-%m-%d %H:%M:%S")) ..
+		table.concat(OUTPUT, "\n")
 	local ok = pcall(_writefile, OUT_FILE, payload)
-	saveBtn.Text = ok and ("✓ "..#payload.."b") or "✗"
-	task.delay(2, function() if saveBtn.Parent then saveBtn.Text="💾 Save log" end end)
-end)
-smallBtn(117, 268, 108, "↻ Reset", C.CARD, function()
-	stats.totalFires=0; stats.totalMined=0; stats.bestMinedPerSec=0
+	saveBtn.Text = ok and ("✓ "..#payload.."b") or "✗ fail"
+	task.delay(2, function() if saveBtn.Parent then saveBtn.Text="💾 Save output" end end)
 end)
 
--- LOG
-local logFrame = Instance.new("ScrollingFrame")
-logFrame.Size=UDim2.new(1,-10,1,-300); logFrame.Position=UDim2.new(0,5,0,296)
-logFrame.BackgroundColor3=C.DEEP; logFrame.BorderSizePixel=0
-logFrame.ScrollBarThickness=3; logFrame.AutomaticCanvasSize=Enum.AutomaticSize.Y
-logFrame.CanvasSize=UDim2.new(0,0,0,0)
-logFrame.ScrollBarImageColor3=C.DIM; logFrame.Parent=root; corner(logFrame,4)
+-- Snippets scrolling list
+local snipTitle = Instance.new("TextLabel")
+snipTitle.Size=UDim2.new(1,-10,0,14); snipTitle.Position=UDim2.new(0,5,0,52)
+snipTitle.BackgroundTransparency=1; snipTitle.Text="SNIPPETS (tap to run)"
+snipTitle.Font=Enum.Font.GothamBold; snipTitle.TextSize=9
+snipTitle.TextColor3=C.DIM; snipTitle.TextXAlignment=Enum.TextXAlignment.Left
+snipTitle.Parent=root
 
-local logText = Instance.new("TextLabel")
-logText.Size=UDim2.new(1,-6,0,0); logText.Position=UDim2.new(0,3,0,3)
-logText.AutomaticSize=Enum.AutomaticSize.Y; logText.BackgroundTransparency=1
-logText.Font=Enum.Font.Code; logText.TextSize=8; logText.TextColor3=C.TXT
-logText.TextXAlignment=Enum.TextXAlignment.Left
-logText.TextYAlignment=Enum.TextYAlignment.Top
-logText.TextWrapped=true; logText.Text=""; logText.Parent=logFrame
+local snipFrame = Instance.new("ScrollingFrame")
+snipFrame.Size=UDim2.new(1,-10,0,140); snipFrame.Position=UDim2.new(0,5,0,68)
+snipFrame.BackgroundColor3=C.DEEP; snipFrame.BorderSizePixel=0
+snipFrame.ScrollBarThickness=3; snipFrame.AutomaticCanvasSize=Enum.AutomaticSize.Y
+snipFrame.CanvasSize=UDim2.new(0,0,0,0)
+snipFrame.ScrollBarImageColor3=C.DIM; snipFrame.Parent=root; corner(snipFrame,4)
+
+local snipLayout = Instance.new("UIListLayout")
+snipLayout.Padding = UDim.new(0, 2)
+snipLayout.SortOrder = Enum.SortOrder.LayoutOrder
+snipLayout.Parent = snipFrame
+
+local codeInput  -- forward decl
+
+for i, snip in ipairs(SNIPPETS) do
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, -6, 0, 22); row.BackgroundColor3 = C.CARD
+	row.BorderSizePixel = 0; row.Parent = snipFrame; corner(row, 3)
+	row.LayoutOrder = i
+
+	local runB = Instance.new("TextButton")
+	runB.Size = UDim2.new(1, -50, 1, 0); runB.Position = UDim2.new(0, 0, 0, 0)
+	runB.BackgroundTransparency = 1; runB.AutoButtonColor = false
+	runB.Text = "  " .. snip.name; runB.Font = Enum.Font.GothamBold
+	runB.TextSize = 9; runB.TextColor3 = C.TXT
+	runB.TextXAlignment = Enum.TextXAlignment.Left; runB.Parent = row
+	runB.MouseButton1Click:Connect(function()
+		task.spawn(function() runCode(snip.code) end)
+	end)
+
+	local edB = Instance.new("TextButton")
+	edB.Size = UDim2.new(0, 44, 1, -2); edB.Position = UDim2.new(1, -47, 0, 1)
+	edB.BackgroundColor3 = C.PURPLE; edB.AutoButtonColor = false
+	edB.Text = "edit"; edB.Font = Enum.Font.GothamBold
+	edB.TextSize = 8; edB.TextColor3 = C.TXT; edB.Parent = row
+	corner(edB, 3)
+	edB.MouseButton1Click:Connect(function()
+		if codeInput then codeInput.Text = snip.code end
+	end)
+end
+
+-- Code input
+local codeTitle = Instance.new("TextLabel")
+codeTitle.Size=UDim2.new(1,-10,0,14); codeTitle.Position=UDim2.new(0,5,0,213)
+codeTitle.BackgroundTransparency=1; codeTitle.Text="CUSTOM LUA  (edit + Run)"
+codeTitle.Font=Enum.Font.GothamBold; codeTitle.TextSize=9
+codeTitle.TextColor3=C.DIM; codeTitle.TextXAlignment=Enum.TextXAlignment.Left
+codeTitle.Parent=root
+
+codeInput = Instance.new("TextBox")
+codeInput.Size=UDim2.new(1,-10,0,70); codeInput.Position=UDim2.new(0,5,0,229)
+codeInput.BackgroundColor3=C.DEEP; codeInput.BorderSizePixel=0
+codeInput.Font=Enum.Font.Code; codeInput.TextSize=9
+codeInput.TextColor3=C.TXT; codeInput.TextXAlignment=Enum.TextXAlignment.Left
+codeInput.TextYAlignment=Enum.TextYAlignment.Top
+codeInput.MultiLine=true; codeInput.ClearTextOnFocus=false
+codeInput.PlaceholderText="-- type Lua here\ndprint(nearest())"
+codeInput.PlaceholderColor3=C.DIM; codeInput.Text=""
+codeInput.Parent=root; corner(codeInput,4)
+local cp=Instance.new("UIPadding"); cp.PaddingLeft=UDim.new(0,4); cp.PaddingTop=UDim.new(0,3); cp.Parent=codeInput
+
+local runBtn = Instance.new("TextButton")
+runBtn.Size=UDim2.new(0.5,-7,0,22); runBtn.Position=UDim2.new(0,5,0,303)
+runBtn.BackgroundColor3=C.OK; runBtn.AutoButtonColor=false
+runBtn.Text="▶ Run"; runBtn.Font=Enum.Font.GothamBold; runBtn.TextSize=10
+runBtn.TextColor3=C.TXT; runBtn.Parent=root; corner(runBtn,4)
+runBtn.MouseButton1Click:Connect(function()
+	if codeInput.Text ~= "" then
+		task.spawn(function() runCode(codeInput.Text) end)
+	end
+end)
+
+local clearBtn = Instance.new("TextButton")
+clearBtn.Size=UDim2.new(0.5,-7,0,22); clearBtn.Position=UDim2.new(0.5,2,0,303)
+clearBtn.BackgroundColor3=C.CARD; clearBtn.AutoButtonColor=false
+clearBtn.Text="🗑 Clear output"; clearBtn.Font=Enum.Font.GothamBold; clearBtn.TextSize=9
+clearBtn.TextColor3=C.TXT; clearBtn.Parent=root; corner(clearBtn,4)
+clearBtn.MouseButton1Click:Connect(function()
+	OUTPUT = {}
+	dprint("output cleared")
+end)
+
+-- Output console
+local outTitle = Instance.new("TextLabel")
+outTitle.Size=UDim2.new(1,-10,0,14); outTitle.Position=UDim2.new(0,5,0,329)
+outTitle.BackgroundTransparency=1; outTitle.Text="OUTPUT"
+outTitle.Font=Enum.Font.GothamBold; outTitle.TextSize=9
+outTitle.TextColor3=C.DIM; outTitle.TextXAlignment=Enum.TextXAlignment.Left
+outTitle.Parent=root
+
+local outFrame = Instance.new("ScrollingFrame")
+outFrame.Size=UDim2.new(1,-10,1,-350); outFrame.Position=UDim2.new(0,5,0,346)
+outFrame.BackgroundColor3=C.DEEP; outFrame.BorderSizePixel=0
+outFrame.ScrollBarThickness=3; outFrame.AutomaticCanvasSize=Enum.AutomaticSize.Y
+outFrame.CanvasSize=UDim2.new(0,0,0,0)
+outFrame.ScrollBarImageColor3=C.DIM; outFrame.Parent=root; corner(outFrame,4)
+
+local outText = Instance.new("TextLabel")
+outText.Size=UDim2.new(1,-6,0,0); outText.Position=UDim2.new(0,3,0,3)
+outText.AutomaticSize=Enum.AutomaticSize.Y; outText.BackgroundTransparency=1
+outText.Font=Enum.Font.Code; outText.TextSize=8; outText.TextColor3=C.TXT
+outText.TextXAlignment=Enum.TextXAlignment.Left
+outText.TextYAlignment=Enum.TextYAlignment.Top
+outText.TextWrapped=true; outText.Text=""; outText.Parent=outFrame
 
 setZIndex(root, 10000)
 
+-- Drag
 do
 	local dragging, ds, sp_ = false, nil, nil
 	titleBar.InputBegan:Connect(function(input)
@@ -468,10 +580,11 @@ do
 	end)
 end
 
+-- Bubble
 local bubble = Instance.new("TextButton")
 bubble.Size=UDim2.new(0,40,0,40); bubble.Position=UDim2.new(0,10,0,10)
 bubble.BackgroundColor3=C.GOLD; bubble.AutoButtonColor=false
-bubble.Text="R18"; bubble.Font=Enum.Font.GothamBlack
+bubble.Text="DBG"; bubble.Font=Enum.Font.GothamBlack
 bubble.TextSize=11; bubble.TextColor3=C.DEEP
 bubble.Visible=false; bubble.ZIndex=10100; bubble.Parent=gui
 do
@@ -481,27 +594,21 @@ end
 hideBtn.MouseButton1Click:Connect(function() root.Visible=false; bubble.Visible=true end)
 bubble.MouseButton1Click:Connect(function() root.Visible=true; bubble.Visible=false end)
 
+-- Output refresher
 task.spawn(function()
 	while gui.Parent do
 		task.wait(0.3)
-		if status.Parent then
-			local eff = stats.firesPerSec > 0 and (stats.minedPerSec / stats.firesPerSec) or 0
-			status.Text = ("  %s %s walk=%s\n  tgts=%d f/s=%d MINED/s=%d\n  AOE=%.1fx  tot=%d  peak=%d"):format(
-				stats.radiusOn and "ON" or "off",
-				stats.pulsePhase == "burst" and "▶BURST" or "·rest",
-				stats.autoWalk and "ON" or "off",
-				stats.targetsFound, stats.firesPerSec, stats.minedPerSec,
-				eff, stats.totalMined, stats.bestMinedPerSec)
-		end
-		if logText.Parent then
-			local start = math.max(1, #LOG - 25)
+		if outText.Parent then
+			local start = math.max(1, #OUTPUT - 60)
 			local arr = {}
-			for i = start, #LOG do arr[#arr+1] = LOG[i] end
-			logText.Text = table.concat(arr, "\n")
-			logFrame.CanvasPosition = Vector2.new(0, logText.AbsoluteSize.Y)
+			for i = start, #OUTPUT do arr[#arr+1] = OUTPUT[i] end
+			outText.Text = table.concat(arr, "\n")
+			outFrame.CanvasPosition = Vector2.new(0, outText.AbsoluteSize.Y)
 		end
 	end
 end)
 
-log("v18 ready — pulse=ON burst=5s rest=2s")
-log("AOE pickaxe gives ~2x mines per fire; cap is ~150 mines / burst")
+dprint("MachinaDebug v19 ready")
+dprint("10 snippets above. Tap one to run, or tap 'edit' to load into editor.")
+dprint("Sniffer captures all FireServer to this console.")
+dprint("Save dumps everything to MachinaRecon.txt.")
