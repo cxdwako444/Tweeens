@@ -307,10 +307,12 @@ pcall(function()
 		local method = getnamecallmethod and getnamecallmethod() or ""
 		if method == "FireServer" or method == "InvokeServer" then
 			fireCount = fireCount + 1
-			pcall(function()
-				log(("[FIRE #%d] %s :%s(%s)"):format(
-					fireCount, self:GetFullName(), method, serArgs(...)))
-			end)
+			-- capture ... here; inner closures can't see outer varargs
+			local argsStr = serArgs(...)
+			local path = "?"
+			pcall(function() path = self:GetFullName() end)
+			pcall(log, ("[FIRE #%d] %s :%s(%s)"):format(
+				fireCount, path, method, argsStr))
 		end
 		return oldNC(self, ...)
 	end)
