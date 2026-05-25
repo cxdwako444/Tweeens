@@ -1,26 +1,23 @@
 --!nocheck
 -- ============================================================
--- MACHINA RECON v17  —  BULK BUFFER + REMOTE EXPLORATION
+-- MACHINA RECON v18  —  TUNED FOR REALITY
 -- Branch: claude/rare-indicator-auto-aim-mC8LF
 -- File:   MachinaRecon.txt
 --
--- WHY V16 STILL HIT 14/sec:
---   The server cap is per-FireServer-call. Each call = 1 mine.
---   No client trick increases that without changing tool stats.
+-- WHAT WE PROVED IN v17:
+--   - Bulk buffer:     0 mines  (server reads 1 block per call)
+--   - DataEvent:       0 mines  (mining only goes through RemoteEvent)
+--   - Probe of 15 alt cmds: 0 mines (no hidden mining commands)
 --
--- v17 TESTS REAL EXPLOITS:
---   1. BULK BUFFER: pack N×32 bytes into one buffer, send 1 call.
---      If server reads all N, throughput multiplies by N.
---   2. DATA EVENT: try the other RemoteEvent we never used.
---      Might have its own rate limit (or none).
---   3. COMMAND VARIANTS: try "MineBlock", "BulkDamage", etc.
---      Production servers sometimes accept dev/admin commands.
+-- WHAT WE FOUND:
+--   - Single mode mined 47/sec at peak (20 fires/sec × 2.35 AOE)
+--   - Burst lasts ~5 sec then server throttles to 0
+--   - Long pause (~30+ sec) refills the budget
 --
--- HOW TO USE:
---   - Buttons let you switch between Single / Bulk / DataEvent
---   - Watch MINED/s after switching — if it jumps, we found a bypass
---   - "Probe Commands" button fires speculative cmd names once each
---     and logs which (if any) caused a noticeable mine spike
+-- v18 OPTIMIZES THE PROVEN PATTERN:
+--   1. Auto-pulse: 5 sec ON → 2 sec OFF cycle (preserves burst budget)
+--   2. Auto-walk: small CFrame nudge to enter new block clusters
+--   3. Tuned defaults from your best-performing v17 settings
 -- ============================================================
 
 local Players          = game:GetService("Players")
@@ -33,13 +30,12 @@ local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
 local OUT_FILE       = "MachinaRecon.txt"
 local MAGIC_NONCE    = string.char(255,255,255,255)
 local RE             = ReplicatedStorage:WaitForChild("RemoteEvent")
-local DE             = ReplicatedStorage:FindFirstChild("DataEvent")
 local ORIGIN         = Vector3.new(12000, 12000, 12000)
 local BLOCK_SIZE     = 6
 local MINE_PROXIMITY = 40
 
 -- ============================================================
--- ENV
+-- ENV / LOG
 -- ============================================================
 local function find(n)
 	local v = rawget(_G, n); if v then return v end
@@ -49,68 +45,33 @@ local function find(n)
 end
 local _writefile = find("writefile")
 
--- ============================================================
--- LOG
--- ============================================================
 local LOG = {}
 local function tstamp() return os.date("%H:%M:%S") end
 local function log(msg)
 	table.insert(LOG, ("[%s] %s"):format(tstamp(), tostring(msg)))
-	if #LOG > 300 then table.remove(LOG, 1) end
+	if #LOG > 250 then table.remove(LOG, 1) end
 end
 
 -- ============================================================
--- REMOTE / BUFFER WRAPPERS
+-- REMOTE / BUFFER
 -- ============================================================
-local function snapCoord(c, origin)
-	return math.floor((c - origin) / BLOCK_SIZE + 0.5) * BLOCK_SIZE + origin
-end
-
-local function writeBlockToBuffer(b, off, wx, wy, wz, damage)
-	buffer.writef64(b, off + 0,  (snapCoord(wz, ORIGIN.Z) - ORIGIN.Z) / BLOCK_SIZE)
-	buffer.writef64(b, off + 8,  (snapCoord(wy, ORIGIN.Y) - ORIGIN.Y) / BLOCK_SIZE)
-	buffer.writef64(b, off + 16, (snapCoord(wx, ORIGIN.X) - ORIGIN.X) / BLOCK_SIZE)
-	buffer.writef64(b, off + 24, damage)
-end
-
+local function snap(c, origin) return math.floor((c - origin) / BLOCK_SIZE + 0.5) * BLOCK_SIZE + origin end
 local function makeMineBuffer(wx, wy, wz, damage)
 	local b = buffer.create(32)
-	writeBlockToBuffer(b, 0, wx, wy, wz, damage)
+	buffer.writef64(b, 0,  (snap(wz, ORIGIN.Z) - ORIGIN.Z) / BLOCK_SIZE)
+	buffer.writef64(b, 8,  (snap(wy, ORIGIN.Y) - ORIGIN.Y) / BLOCK_SIZE)
+	buffer.writef64(b, 16, (snap(wx, ORIGIN.X) - ORIGIN.X) / BLOCK_SIZE)
+	buffer.writef64(b, 24, damage)
 	return b
 end
-
-local function makeBulkBuffer(positions, damage)
-	local b = buffer.create(#positions * 32)
-	for i, pos in ipairs(positions) do
-		writeBlockToBuffer(b, (i-1) * 32, pos.x, pos.y, pos.z, damage)
-	end
-	return b
-end
-
 local function randomNonce()
-	return string.char(
-		math.random(0,255), math.random(0,255),
-		math.random(0,255), math.random(0,255))
+	return string.char(math.random(0,255), math.random(0,255), math.random(0,255), math.random(0,255))
 end
-
-local function fireSingle(remote, x, y, z, dmg)
-	pcall(function()
-		remote:FireServer(randomNonce(), "DamageBlockSmooth",
-			makeMineBuffer(x, y, z, dmg))
-	end)
+local function fireMine(x, y, z, dmg)
+	pcall(function() RE:FireServer(randomNonce(), "DamageBlockSmooth", makeMineBuffer(x, y, z, dmg)) end)
 end
-
-local function fireBulk(remote, positions, dmg, cmd)
-	pcall(function()
-		remote:FireServer(randomNonce(), cmd or "DamageBlockSmooth",
-			makeBulkBuffer(positions, dmg))
-	end)
-end
-
 local function setMineMode(on)
-	pcall(function()
-		RE:FireServer(MAGIC_NONCE, "SetMode", on and "Mine" or "None")
-	end)
+	pcall(function() RE:FireServer(MAGIC_NONCE, "SetMode", on and "Mine" or "None") end)
 end
 
 -- ============================================================
@@ -118,8 +79,7 @@ end
 -- ============================================================
 local function collectTargets(playerPos, radius)
 	local r2 = radius * radius
-	local seen = {}
-	local result = {}
+	local seen, result = {}, {}
 	local function tryAdd(part)
 		if not part:IsA("BasePart") then return end
 		local p = part.Position
@@ -154,10 +114,13 @@ end
 -- ============================================================
 local stats = {
 	radiusOn = false,
-	mode = "Single",          -- Single | Bulk | BulkDataEvent
+	pulseMode = true,        -- auto burst/rest cycle
+	autoWalk = false,        -- micro-teleport for fresh chunks
+	burstSec = 5,
+	restSec = 2,
 	radius = 24,
-	bulkSize = 10,            -- blocks per bulk call
-	rateHz = 30,
+	maxTgts = 10,
+	rateHz = 25,
 	damage = 0.1,
 	totalFires = 0,
 	firesThisSec = 0,
@@ -167,6 +130,8 @@ local stats = {
 	totalMined = 0,
 	targetsFound = 0,
 	rrIdx = 1,
+	pulsePhase = "rest",
+	bestMinedPerSec = 0,
 }
 
 -- ============================================================
@@ -198,56 +163,79 @@ task.spawn(function()
 		task.wait(1.0)
 		stats.minedPerSec = stats.minedThisSec; stats.minedThisSec = 0
 		stats.firesPerSec = stats.firesThisSec; stats.firesThisSec = 0
+		if stats.minedPerSec > stats.bestMinedPerSec then
+			stats.bestMinedPerSec = stats.minedPerSec
+		end
 		if stats.radiusOn then
-			log(("[%s] tgts=%d f/s=%d MINED/s=%d tot=%d"):format(
-				stats.mode, stats.targetsFound, stats.firesPerSec,
-				stats.minedPerSec, stats.totalMined))
+			local eff = stats.firesPerSec > 0 and (stats.minedPerSec / stats.firesPerSec) or 0
+			log(("%s tgts=%d f/s=%d MINED=%d  AOE=%.1fx  tot=%d"):format(
+				stats.pulsePhase=="burst" and "▶" or "·",
+				stats.targetsFound, stats.firesPerSec, stats.minedPerSec, eff, stats.totalMined))
 		end
 	end
 end)
 
 -- ============================================================
--- MINING LOOP — dispatch based on mode
+-- PULSE LOOP — alternates SetMode Mine/None
 -- ============================================================
 task.spawn(function()
 	while true do
-		if stats.radiusOn then
+		if stats.radiusOn and stats.pulseMode then
+			stats.pulsePhase = "burst"
+			setMineMode(true)
+			task.wait(stats.burstSec)
+			stats.pulsePhase = "rest"
+			setMineMode(false)
+			task.wait(stats.restSec)
+		elseif stats.radiusOn then
+			stats.pulsePhase = "burst"  -- always burst when pulse off
+			task.wait(0.3)
+		else
+			stats.pulsePhase = "rest"
+			task.wait(0.2)
+		end
+	end
+end)
+
+-- ============================================================
+-- AUTO-WALK — small CFrame nudge to find fresh clusters
+-- ============================================================
+task.spawn(function()
+	local angle = 0
+	while true do
+		task.wait(2.0)
+		if stats.radiusOn and stats.autoWalk then
+			local char = LocalPlayer.Character
+			local hrp = char and char:FindFirstChild("HumanoidRootPart")
+			if hrp then
+				angle = angle + math.pi / 3
+				local dx = math.cos(angle) * 6
+				local dz = math.sin(angle) * 6
+				pcall(function() hrp.CFrame = hrp.CFrame + Vector3.new(dx, 0, dz) end)
+			end
+		end
+	end
+end)
+
+-- ============================================================
+-- MINING LOOP — round-robin during burst
+-- ============================================================
+task.spawn(function()
+	while true do
+		if stats.radiusOn and stats.pulsePhase == "burst" then
 			local char = LocalPlayer.Character
 			local hrp = char and char:FindFirstChild("HumanoidRootPart")
 			if hrp then
 				local targets = collectTargets(hrp.Position, stats.radius)
 				stats.targetsFound = #targets
 				if #targets > 0 then
-					if stats.mode == "Single" then
-						-- Round-robin single call
-						local n = math.min(10, #targets)
-						local idx = ((stats.rrIdx - 1) % n) + 1
-						stats.rrIdx = stats.rrIdx + 1
-						local t = targets[idx]
-						fireSingle(RE, t.x, t.y, t.z, stats.damage)
-						stats.totalFires = stats.totalFires + 1
-						stats.firesThisSec = stats.firesThisSec + 1
-
-					elseif stats.mode == "Bulk" then
-						-- Pack N blocks into one buffer, one FireServer call
-						local n = math.min(stats.bulkSize, #targets)
-						local pack = {}
-						for i = 1, n do pack[i] = targets[i] end
-						fireBulk(RE, pack, stats.damage)
-						stats.totalFires = stats.totalFires + 1
-						stats.firesThisSec = stats.firesThisSec + 1
-
-					elseif stats.mode == "BulkDataEvent" then
-						-- Same as Bulk but use the DataEvent remote
-						if DE then
-							local n = math.min(stats.bulkSize, #targets)
-							local pack = {}
-							for i = 1, n do pack[i] = targets[i] end
-							fireBulk(DE, pack, stats.damage)
-							stats.totalFires = stats.totalFires + 1
-							stats.firesThisSec = stats.firesThisSec + 1
-						end
-					end
+					local n = math.min(stats.maxTgts, #targets)
+					local idx = ((stats.rrIdx - 1) % n) + 1
+					stats.rrIdx = stats.rrIdx + 1
+					local t = targets[idx]
+					fireMine(t.x, t.y, t.z, stats.damage)
+					stats.totalFires = stats.totalFires + 1
+					stats.firesThisSec = stats.firesThisSec + 1
 				end
 			else
 				stats.targetsFound = 0
@@ -258,36 +246,6 @@ task.spawn(function()
 		end
 	end
 end)
-
--- ============================================================
--- PROBE: try speculative command names once
--- ============================================================
-local function probeCommands()
-	local char = LocalPlayer.Character
-	local hrp = char and char:FindFirstChild("HumanoidRootPart")
-	if not hrp then log("probe: no character"); return end
-	local targets = collectTargets(hrp.Position, 18)
-	if #targets == 0 then log("probe: no targets"); return end
-	local t = targets[1]
-	local cmds = {
-		"DamageBlock", "MineBlock", "BulkDamage", "BulkMine",
-		"BreakBlock", "DestroyBlock", "AreaMine", "RadiusMine",
-		"InstantMine", "AOEDamage", "ChunkDamage", "DamageChunk",
-		"DamageBlocks", "DamageBlocksSmooth", "MineArea",
-	}
-	log("probe: firing " .. #cmds .. " speculative cmds")
-	local before = stats.totalMined
-	for _, cmd in ipairs(cmds) do
-		pcall(function()
-			RE:FireServer(randomNonce(), cmd,
-				makeMineBuffer(t.x, t.y, t.z, stats.damage))
-		end)
-		task.wait(0.1)
-	end
-	task.wait(0.5)
-	local diff = stats.totalMined - before
-	log(("probe done: mined +%d during probe"):format(diff))
-end
 
 -- ============================================================
 -- UI
@@ -303,11 +261,11 @@ local C = {
 local function corner(o,r) local c=Instance.new("UICorner") c.CornerRadius=UDim.new(0,r or 5) c.Parent=o end
 local function stroke(o,col,t) local s=Instance.new("UIStroke") s.Color=col s.Thickness=t or 1 s.Parent=o end
 
-local old = PlayerGui:FindFirstChild("MachinaReconV17")
+local old = PlayerGui:FindFirstChild("MachinaReconV18")
 if old then old:Destroy() end
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "MachinaReconV17"
+gui.Name = "MachinaReconV18"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -337,7 +295,7 @@ fix.Position=UDim2.new(0,0,1,-8); fix.BackgroundColor3=C.DEEP
 fix.BorderSizePixel=0; fix.Parent=titleBar
 local titleLbl=Instance.new("TextLabel"); titleLbl.Size=UDim2.new(1,-30,1,0)
 titleLbl.Position=UDim2.new(0,7,0,0); titleLbl.BackgroundTransparency=1
-titleLbl.Text="RECON v17 BULK"; titleLbl.Font=Enum.Font.GothamBlack
+titleLbl.Text="RECON v18 — TUNED"; titleLbl.Font=Enum.Font.GothamBlack
 titleLbl.TextSize=10; titleLbl.TextColor3=C.GOLD
 titleLbl.TextXAlignment=Enum.TextXAlignment.Left; titleLbl.Parent=titleBar
 
@@ -349,7 +307,7 @@ hideBtn.TextSize=12; hideBtn.TextColor3=C.TXT
 hideBtn.Parent=titleBar; corner(hideBtn,3)
 
 local status=Instance.new("TextLabel")
-status.Size=UDim2.new(1,-10,0,32); status.Position=UDim2.new(0,5,0,25)
+status.Size=UDim2.new(1,-10,0,44); status.Position=UDim2.new(0,5,0,25)
 status.BackgroundColor3=C.CARD; status.BorderSizePixel=0
 status.Font=Enum.Font.Code; status.TextSize=9; status.TextColor3=C.OK
 status.Text="  ready"; status.TextXAlignment=Enum.TextXAlignment.Left
@@ -358,7 +316,7 @@ status.TextWrapped=true; status.Parent=root; corner(status,4)
 local sp=Instance.new("UIPadding"); sp.PaddingLeft=UDim.new(0,5); sp.PaddingTop=UDim.new(0,2); sp.Parent=status
 
 local rmBtn = Instance.new("TextButton")
-rmBtn.Size=UDim2.new(1,-10,0,30); rmBtn.Position=UDim2.new(0,5,0,60)
+rmBtn.Size=UDim2.new(1,-10,0,28); rmBtn.Position=UDim2.new(0,5,0,72)
 rmBtn.BackgroundColor3=C.RED; rmBtn.AutoButtonColor=false
 rmBtn.Text="RADIUS MINE: OFF"; rmBtn.Font=Enum.Font.GothamBlack
 rmBtn.TextSize=11; rmBtn.TextColor3=C.TXT
@@ -367,8 +325,31 @@ rmBtn.MouseButton1Click:Connect(function()
 	stats.radiusOn = not stats.radiusOn
 	rmBtn.Text = stats.radiusOn and "RADIUS MINE: ON ✦" or "RADIUS MINE: OFF"
 	rmBtn.BackgroundColor3 = stats.radiusOn and C.OK or C.RED
-	if stats.radiusOn then setMineMode(true); log("RM ON mode="..stats.mode)
-	else setMineMode(false); log("RM OFF") end
+	if stats.radiusOn then setMineMode(true) else setMineMode(false) end
+end)
+
+-- Pulse toggle
+local pulseBtn = Instance.new("TextButton")
+pulseBtn.Size=UDim2.new(0.5,-7,0,22); pulseBtn.Position=UDim2.new(0,5,0,104)
+pulseBtn.BackgroundColor3=C.OK; pulseBtn.AutoButtonColor=false
+pulseBtn.Text="PULSE ON"; pulseBtn.Font=Enum.Font.GothamBold; pulseBtn.TextSize=9
+pulseBtn.TextColor3=C.TXT; pulseBtn.Parent=root; corner(pulseBtn,4)
+pulseBtn.MouseButton1Click:Connect(function()
+	stats.pulseMode = not stats.pulseMode
+	pulseBtn.Text = stats.pulseMode and "PULSE ON" or "PULSE OFF"
+	pulseBtn.BackgroundColor3 = stats.pulseMode and C.OK or C.CARD
+end)
+
+-- AutoWalk toggle
+local walkBtn = Instance.new("TextButton")
+walkBtn.Size=UDim2.new(0.5,-7,0,22); walkBtn.Position=UDim2.new(0.5,2,0,104)
+walkBtn.BackgroundColor3=C.CARD; walkBtn.AutoButtonColor=false
+walkBtn.Text="AUTO-WALK OFF"; walkBtn.Font=Enum.Font.GothamBold; walkBtn.TextSize=9
+walkBtn.TextColor3=C.TXT; walkBtn.Parent=root; corner(walkBtn,4)
+walkBtn.MouseButton1Click:Connect(function()
+	stats.autoWalk = not stats.autoWalk
+	walkBtn.Text = stats.autoWalk and "AUTO-WALK ON" or "AUTO-WALK OFF"
+	walkBtn.BackgroundColor3 = stats.autoWalk and C.OK or C.CARD
 end)
 
 local function pillRow(y, label, values, getter, setter)
@@ -388,7 +369,7 @@ local function pillRow(y, label, values, getter, setter)
 		b.AutoButtonColor=false; b.Text=tostring(v); b.Font=Enum.Font.GothamBold
 		b.TextSize=8; b.TextColor3=C.TXT; b.Parent=root; corner(b,3)
 		b.MouseButton1Click:Connect(function()
-			setter(v); log("set " .. label .. " = " .. tostring(v))
+			setter(v)
 			for j, bb in ipairs(boxes) do
 				bb.BackgroundColor3 = (values[j] == v) and C.BLUE or C.CARD
 			end
@@ -397,12 +378,11 @@ local function pillRow(y, label, values, getter, setter)
 	end
 end
 
--- MODE PILL — the headline test
-pillRow( 96, "MODE",  {"Single","Bulk","BulkDataEvent"}, function() return stats.mode end, function(v) stats.mode=v end)
-pillRow(118, "Rad",   {12,18,24,36,50},     function() return stats.radius end,   function(v) stats.radius=v end)
-pillRow(140, "Bulk",  {2,5,10,20,50},       function() return stats.bulkSize end, function(v) stats.bulkSize=v end)
-pillRow(162, "Hz",    {5,10,20,30,60},      function() return stats.rateHz end,   function(v) stats.rateHz=v end)
-pillRow(184, "Dmg",   {0.05,0.1,0.5,1,5},   function() return stats.damage end,   function(v) stats.damage=v end)
+pillRow(132, "Burst", {3,5,7,10},        function() return stats.burstSec end, function(v) stats.burstSec=v end)
+pillRow(154, "Rest",  {1,2,3,5},         function() return stats.restSec end,  function(v) stats.restSec=v end)
+pillRow(176, "Rad",   {12,18,24,36,50},  function() return stats.radius end,   function(v) stats.radius=v end)
+pillRow(198, "Pool",  {5,10,15,20},      function() return stats.maxTgts end,  function(v) stats.maxTgts=v end)
+pillRow(220, "Hz",    {15,25,40,60},     function() return stats.rateHz end,   function(v) stats.rateHz=v end)
 
 local function smallBtn(x, y, w, text, color, click)
 	local b = Instance.new("TextButton")
@@ -414,31 +394,28 @@ local function smallBtn(x, y, w, text, color, click)
 	return b
 end
 
-smallBtn(5, 210, 108, "★ AUTO ON", C.OK, function()
+smallBtn(5, 244, 108, "★ AUTO ON", C.OK, function()
 	pcall(function() RE:FireServer(MAGIC_NONCE, "SetAutoMine", true) end)
-	log("AutoMine TRUE")
 end)
-smallBtn(117, 210, 108, "■ AUTO OFF", C.RED, function()
+smallBtn(117, 244, 108, "■ AUTO OFF", C.RED, function()
 	pcall(function() RE:FireServer(MAGIC_NONCE, "SetAutoMine", false) end)
-	log("AutoMine FALSE")
 end)
 
-smallBtn(5, 234, 108, "🔬 Probe cmds", C.WARN, function()
-	task.spawn(probeCommands)
-end)
-local saveBtn = smallBtn(117, 234, 108, "💾 Save log", C.BLUE, function() end)
+local saveBtn = smallBtn(5, 268, 108, "💾 Save log", C.BLUE, function() end)
 saveBtn.MouseButton1Click:Connect(function()
 	if not _writefile then saveBtn.Text="✗"; return end
 	local hdr = {
-		"===== RECON v17 LOG =====",
+		"===== RECON v18 LOG =====",
 		("Saved: %s"):format(os.date("%Y-%m-%d %H:%M:%S")),
 		("Player: %s"):format(LocalPlayer.Name),
-		("RM=%s mode=%s r=%d bulk=%d hz=%d dmg=%s"):format(
+		("RM=%s pulse=%s walk=%s burst=%ss rest=%ss r=%d pool=%d hz=%d dmg=%s"):format(
 			stats.radiusOn and "ON" or "OFF",
-			stats.mode, stats.radius, stats.bulkSize, stats.rateHz,
-			tostring(stats.damage)),
-		("fires=%d  mined=%d"):format(stats.totalFires, stats.totalMined),
-		("DataEvent exists: %s"):format(tostring(DE ~= nil)),
+			stats.pulseMode and "ON" or "OFF",
+			stats.autoWalk and "ON" or "OFF",
+			stats.burstSec, stats.restSec, stats.radius,
+			stats.maxTgts, stats.rateHz, tostring(stats.damage)),
+		("fires=%d  mined=%d  best/s=%d"):format(
+			stats.totalFires, stats.totalMined, stats.bestMinedPerSec),
 		"",
 	}
 	local body = {}
@@ -448,12 +425,13 @@ saveBtn.MouseButton1Click:Connect(function()
 	saveBtn.Text = ok and ("✓ "..#payload.."b") or "✗"
 	task.delay(2, function() if saveBtn.Parent then saveBtn.Text="💾 Save log" end end)
 end)
-
-smallBtn(5, 258, 220, "+ Mark", C.CARD, function() log("=== MARK ===") end)
+smallBtn(117, 268, 108, "↻ Reset", C.CARD, function()
+	stats.totalFires=0; stats.totalMined=0; stats.bestMinedPerSec=0
+end)
 
 -- LOG
 local logFrame = Instance.new("ScrollingFrame")
-logFrame.Size=UDim2.new(1,-10,1,-290); logFrame.Position=UDim2.new(0,5,0,286)
+logFrame.Size=UDim2.new(1,-10,1,-300); logFrame.Position=UDim2.new(0,5,0,296)
 logFrame.BackgroundColor3=C.DEEP; logFrame.BorderSizePixel=0
 logFrame.ScrollBarThickness=3; logFrame.AutomaticCanvasSize=Enum.AutomaticSize.Y
 logFrame.CanvasSize=UDim2.new(0,0,0,0)
@@ -493,7 +471,7 @@ end
 local bubble = Instance.new("TextButton")
 bubble.Size=UDim2.new(0,40,0,40); bubble.Position=UDim2.new(0,10,0,10)
 bubble.BackgroundColor3=C.GOLD; bubble.AutoButtonColor=false
-bubble.Text="R17"; bubble.Font=Enum.Font.GothamBlack
+bubble.Text="R18"; bubble.Font=Enum.Font.GothamBlack
 bubble.TextSize=11; bubble.TextColor3=C.DEEP
 bubble.Visible=false; bubble.ZIndex=10100; bubble.Parent=gui
 do
@@ -507,10 +485,13 @@ task.spawn(function()
 	while gui.Parent do
 		task.wait(0.3)
 		if status.Parent then
-			status.Text = ("  %s  mode=%s\n  tgts=%d  f/s=%d  MINED/s=%d  tot=%d"):format(
-				stats.radiusOn and "ON ✦" or "off", stats.mode,
-				stats.targetsFound, stats.firesPerSec,
-				stats.minedPerSec, stats.totalMined)
+			local eff = stats.firesPerSec > 0 and (stats.minedPerSec / stats.firesPerSec) or 0
+			status.Text = ("  %s %s walk=%s\n  tgts=%d f/s=%d MINED/s=%d\n  AOE=%.1fx  tot=%d  peak=%d"):format(
+				stats.radiusOn and "ON" or "off",
+				stats.pulsePhase == "burst" and "▶BURST" or "·rest",
+				stats.autoWalk and "ON" or "off",
+				stats.targetsFound, stats.firesPerSec, stats.minedPerSec,
+				eff, stats.totalMined, stats.bestMinedPerSec)
 		end
 		if logText.Parent then
 			local start = math.max(1, #LOG - 25)
@@ -522,5 +503,5 @@ task.spawn(function()
 	end
 end)
 
-log("v17 ready  DataEvent exists: " .. tostring(DE ~= nil))
-log("test order: Single → Bulk → BulkDataEvent  · also tap Probe cmds")
+log("v18 ready — pulse=ON burst=5s rest=2s")
+log("AOE pickaxe gives ~2x mines per fire; cap is ~150 mines / burst")
