@@ -1,27 +1,26 @@
 --!nocheck
 -- ============================================================
--- MACHINA RECON v10  —  GRID-BASED RADIUS MINE
+-- MACHINA RECON v11  —  REAL TARGETS + ALL-VISIBLE MODE
 -- Branch: claude/rare-indicator-auto-aim-mC8LF
 -- File:   MachinaRecon.txt
 --
--- WHAT v9 GOT WRONG:
---   We iterated workspace.CollisionParts. Problem: mined blocks are
---   removed from that folder immediately. After mining the first
---   ~10 blocks, getChildren() returned empty and we stopped firing.
---   That's why you mined 10 blocks then nothing.
+-- WHY v10 WAS SLOWER:
+--   v10 grid-spammed every cell in radius. The server validates
+--   that a block exists at each (Z,Y,X) before mining. Empty cells
+--   = wasted fires that count toward rate-limit. We were drowning
+--   legit hits in noise.
 --
--- v10 FIX:
---   Generate target positions from a GRID centered on you, snapped
---   to (12000,12000,12000) origin + 6-stud spacing. Doesn't depend
---   on parts existing. Keeps hitting every grid cell in your radius
---   so as soon as a block appears/respawns/streams in, it gets hit.
---
--- DEFAULTS (safe to bump):
---   Radius=12, Hz=10, Hits/blk=1, Damage=1
---   Total fires/sec ~= (cells_in_sphere) * Hz * hits
---   For r=12: 65 cells * 10Hz * 1 = 650 fires/sec
---
--- WATCH "MINED/sec" in the status to tune empirically.
+-- v11 STRATEGY:
+--   - Only fire at REAL parts (union of workspace.CollisionParts
+--     + workspace.Blocks descendants) — these have actual block
+--     positions the server will accept.
+--   - Two modes:
+--       Near  — only parts within radius (default)
+--       All   — every visible mineable part the client knows about
+--               (use when local area runs dry)
+--   - Snap positions to the (12000, 6) grid before firing, so the
+--     buffer values land on exact integer block coords.
+--   - Bigger stats display so you can tune empirically.
 -- ============================================================
 
 local Players          = game:GetService("Players")
@@ -49,28 +48,32 @@ local function find(n)
 end
 local _writefile = find("writefile")
 
-local LOG = {}
-local function log(s)
-	table.insert(LOG, tostring(s))
-	if #LOG > 200 then table.remove(LOG, 1) end
+-- ============================================================
+-- BUFFER + FIRE  (with grid snapping)
+-- ============================================================
+local function snapCoord(c, origin)
+	return math.floor((c - origin) / BLOCK_SIZE + 0.5) * BLOCK_SIZE + origin
 end
 
--- ============================================================
--- BUFFER + FIRE
--- ============================================================
-local function makeMineBuffer(x, y, z, damage)
+local function makeMineBuffer(worldX, worldY, worldZ, damage)
 	local b = buffer.create(32)
-	buffer.writef64(b, 0,  (z - ORIGIN.Z) / BLOCK_SIZE)
-	buffer.writef64(b, 8,  (y - ORIGIN.Y) / BLOCK_SIZE)
-	buffer.writef64(b, 16, (x - ORIGIN.X) / BLOCK_SIZE)
+	-- Snap to integer block coords before division (avoids float drift)
+	local bz = (snapCoord(worldZ, ORIGIN.Z) - ORIGIN.Z) / BLOCK_SIZE
+	local by = (snapCoord(worldY, ORIGIN.Y) - ORIGIN.Y) / BLOCK_SIZE
+	local bx = (snapCoord(worldX, ORIGIN.X) - ORIGIN.X) / BLOCK_SIZE
+	buffer.writef64(b, 0,  bz)
+	buffer.writef64(b, 8,  by)
+	buffer.writef64(b, 16, bx)
 	buffer.writef64(b, 24, damage)
 	return b
 end
+
 local function randomNonce()
 	return string.char(
 		math.random(0,255), math.random(0,255),
 		math.random(0,255), math.random(0,255))
 end
+
 local function fireMine(x, y, z, dmg)
 	pcall(function()
 		R:FireServer(randomNonce(), "DamageBlockSmooth",
@@ -79,38 +82,49 @@ local function fireMine(x, y, z, dmg)
 end
 
 -- ============================================================
--- GRID TARGET GENERATION  (the real fix)
--- Snap player position to (12000 + k*6) grid cells, then enumerate
--- every cell within `radius` studs.
+-- COLLECT TARGETS  (CollisionParts ∪ Blocks-descendants)
 -- ============================================================
-local function snap(coord, origin, size)
-	return math.floor((coord - origin) / size + 0.5) * size + origin
-end
-
-local function generateGridTargets(playerPos, radius)
-	local cx = snap(playerPos.X, ORIGIN.X, BLOCK_SIZE)
-	local cy = snap(playerPos.Y, ORIGIN.Y, BLOCK_SIZE)
-	local cz = snap(playerPos.Z, ORIGIN.Z, BLOCK_SIZE)
-	local n = math.ceil(radius / BLOCK_SIZE)
+local function collectTargets(playerPos, radius, mode)
 	local r2 = radius * radius
-	local targets = {}
-	for dx = -n, n do
-		local ox = dx * BLOCK_SIZE
-		for dy = -n, n do
-			local oy = dy * BLOCK_SIZE
-			for dz = -n, n do
-				local oz = dz * BLOCK_SIZE
-				local d2 = ox*ox + oy*oy + oz*oz
-				if d2 <= r2 then
-					table.insert(targets, {
-						x = cx + ox, y = cy + oy, z = cz + oz, d2 = d2,
-					})
-				end
+	local seen = {}  -- dedupe by grid-snapped key
+	local result = {}
+
+	local function tryAdd(part)
+		if not part:IsA("BasePart") then return end
+		local p = part.Position
+		if mode == "Near" then
+			local dp = p - playerPos
+			if dp.X*dp.X + dp.Y*dp.Y + dp.Z*dp.Z > r2 then return end
+		end
+		-- Snap to grid for dedupe
+		local kx = math.floor((p.X - ORIGIN.X) / BLOCK_SIZE + 0.5)
+		local ky = math.floor((p.Y - ORIGIN.Y) / BLOCK_SIZE + 0.5)
+		local kz = math.floor((p.Z - ORIGIN.Z) / BLOCK_SIZE + 0.5)
+		local key = kx .. "," .. ky .. "," .. kz
+		if seen[key] then return end
+		seen[key] = true
+		table.insert(result, {x=p.X, y=p.Y, z=p.Z})
+	end
+
+	-- CollisionParts (server-recognized mineables)
+	local cp = Workspace:FindFirstChild("CollisionParts")
+	if cp then
+		for _, d in ipairs(cp:GetChildren()) do tryAdd(d) end
+	end
+
+	-- Blocks folder (visual layer; persists longer than CP)
+	local bl = Workspace:FindFirstChild("Blocks")
+	if bl then
+		for _, child in ipairs(bl:GetChildren()) do
+			if child:IsA("BasePart") then
+				tryAdd(child)
+			elseif child:IsA("Folder") or child:IsA("Model") then
+				for _, gc in ipairs(child:GetChildren()) do tryAdd(gc) end
 			end
 		end
 	end
-	table.sort(targets, function(a,b) return a.d2 < b.d2 end)
-	return targets
+
+	return result
 end
 
 -- ============================================================
@@ -118,9 +132,9 @@ end
 -- ============================================================
 local stats = {
 	radiusOn = false,
+	mode = "Near",          -- "Near" or "All"
 	radius = 12,
 	rateHz = 10,
-	hitsPerBlock = 1,
 	damage = 1.0,
 	totalFires = 0,
 	firesThisSec = 0,
@@ -128,13 +142,10 @@ local stats = {
 	minedThisSec = 0,
 	minedPerSec = 0,
 	totalMined = 0,
-	gridCells = 0,
+	targetsFound = 0,
 }
 
--- ============================================================
--- TRACK BLOCKS REMOVED (= server confirmed mined)
--- We watch workspace.Blocks (which doesn't randomly stream out)
--- ============================================================
+-- Track mined blocks (anything removed from Blocks or CollisionParts)
 local function attachWatcher(folder)
 	if not folder then return end
 	folder.DescendantRemoving:Connect(function(c)
@@ -153,15 +164,13 @@ end)
 task.spawn(function()
 	while true do
 		task.wait(1.0)
-		stats.minedPerSec = stats.minedThisSec
-		stats.minedThisSec = 0
-		stats.firesPerSec = stats.firesThisSec
-		stats.firesThisSec = 0
+		stats.minedPerSec = stats.minedThisSec; stats.minedThisSec = 0
+		stats.firesPerSec = stats.firesThisSec; stats.firesThisSec = 0
 	end
 end)
 
 -- ============================================================
--- RADIUS MINE LOOP
+-- LOOP
 -- ============================================================
 task.spawn(function()
 	while true do
@@ -169,17 +178,15 @@ task.spawn(function()
 			local char = LocalPlayer.Character
 			local hrp = char and char:FindFirstChild("HumanoidRootPart")
 			if hrp then
-				local targets = generateGridTargets(hrp.Position, stats.radius)
-				stats.gridCells = #targets
-				for hit = 1, stats.hitsPerBlock do
-					for _, t in ipairs(targets) do
-						fireMine(t.x, t.y, t.z, stats.damage)
-						stats.totalFires = stats.totalFires + 1
-						stats.firesThisSec = stats.firesThisSec + 1
-					end
+				local targets = collectTargets(hrp.Position, stats.radius, stats.mode)
+				stats.targetsFound = #targets
+				for _, t in ipairs(targets) do
+					fireMine(t.x, t.y, t.z, stats.damage)
+					stats.totalFires = stats.totalFires + 1
+					stats.firesThisSec = stats.firesThisSec + 1
 				end
 			else
-				stats.gridCells = 0
+				stats.targetsFound = 0
 			end
 			task.wait(1 / math.max(1, stats.rateHz))
 		else
@@ -202,11 +209,11 @@ local C = {
 local function corner(o,r) local c=Instance.new("UICorner") c.CornerRadius=UDim.new(0,r or 6) c.Parent=o end
 local function stroke(o,col,t) local s=Instance.new("UIStroke") s.Color=col s.Thickness=t or 1 s.Parent=o end
 
-local old = PlayerGui:FindFirstChild("MachinaReconV10")
+local old = PlayerGui:FindFirstChild("MachinaReconV11")
 if old then old:Destroy() end
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "MachinaReconV10"
+gui.Name = "MachinaReconV11"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -214,7 +221,7 @@ gui.DisplayOrder = 9999
 gui.Parent = PlayerGui
 
 local root = Instance.new("Frame")
-root.Size = UDim2.new(0, 270, 0, 360)
+root.Size = UDim2.new(0, 270, 0, 380)
 root.Position = UDim2.new(0, 12, 0, 80)
 root.BackgroundColor3 = C.BG
 root.BorderSizePixel = 0
@@ -228,7 +235,7 @@ local function setZIndex(p, z)
 	for _, c in ipairs(p:GetChildren()) do setZIndex(c, z) end
 end
 
--- Title (24)
+-- Title
 local titleBar = Instance.new("Frame")
 titleBar.Size=UDim2.new(1,0,0,24); titleBar.BackgroundColor3=C.DEEP
 titleBar.BorderSizePixel=0; titleBar.Parent=root; corner(titleBar,8)
@@ -237,8 +244,8 @@ fix.Position=UDim2.new(0,0,1,-10); fix.BackgroundColor3=C.DEEP
 fix.BorderSizePixel=0; fix.Parent=titleBar
 local titleLbl=Instance.new("TextLabel"); titleLbl.Size=UDim2.new(1,-50,1,0)
 titleLbl.Position=UDim2.new(0,8,0,0); titleLbl.BackgroundTransparency=1
-titleLbl.Text="RECON v10 — GRID MINE"; titleLbl.Font=Enum.Font.GothamBlack
-titleLbl.TextSize=10; titleLbl.TextColor3=C.GOLD
+titleLbl.Text="RECON v11"; titleLbl.Font=Enum.Font.GothamBlack
+titleLbl.TextSize=11; titleLbl.TextColor3=C.GOLD
 titleLbl.TextXAlignment=Enum.TextXAlignment.Left; titleLbl.Parent=titleBar
 
 local hideBtn = Instance.new("TextButton")
@@ -248,9 +255,9 @@ hideBtn.Text="−"; hideBtn.Font=Enum.Font.GothamBlack
 hideBtn.TextSize=14; hideBtn.TextColor3=C.TXT
 hideBtn.Parent=titleBar; corner(hideBtn,4)
 
--- BIG STATUS (4 lines, very visible)
+-- BIG STATUS
 local status=Instance.new("TextLabel")
-status.Size=UDim2.new(1,-12,0,56); status.Position=UDim2.new(0,6,0,28)
+status.Size=UDim2.new(1,-12,0,68); status.Position=UDim2.new(0,6,0,28)
 status.BackgroundColor3=C.CARD; status.BorderSizePixel=0
 status.Font=Enum.Font.Code; status.TextSize=10; status.TextColor3=C.OK
 status.Text="  ready"; status.TextXAlignment=Enum.TextXAlignment.Left
@@ -258,7 +265,6 @@ status.TextYAlignment=Enum.TextYAlignment.Top
 status.TextWrapped=true; status.Parent=root; corner(status,5)
 local sp=Instance.new("UIPadding"); sp.PaddingLeft=UDim.new(0,6); sp.PaddingTop=UDim.new(0,4); sp.Parent=status
 
--- Button helpers
 local function btnPair(y, lT, lC, lF, rT, rC, rF)
 	local lb = Instance.new("TextButton")
 	lb.Size=UDim2.new(0.5,-9,0,26); lb.Position=UDim2.new(0,6,0,y)
@@ -283,7 +289,8 @@ local function btnFull(y, text, color, click)
 	b.MouseButton1Click:Connect(click)
 	return b
 end
-local function pillRow(y, label, values, getter, setter)
+local function pillRow(y, label, values, getter, setter, fmt)
+	fmt = fmt or tostring
 	local lbl = Instance.new("TextLabel")
 	lbl.Size=UDim2.new(0,55,0,20); lbl.Position=UDim2.new(0,6,0,y)
 	lbl.BackgroundTransparency=1; lbl.Text=label
@@ -297,7 +304,7 @@ local function pillRow(y, label, values, getter, setter)
 		b.Size=UDim2.new(0,pillW,0,20)
 		b.Position=UDim2.new(0, 65+(i-1)*(pillW+4), 0, y)
 		b.BackgroundColor3 = (getter() == v) and C.BLUE or C.CARD
-		b.AutoButtonColor=false; b.Text=tostring(v); b.Font=Enum.Font.GothamBold
+		b.AutoButtonColor=false; b.Text=fmt(v); b.Font=Enum.Font.GothamBold
 		b.TextSize=9; b.TextColor3=C.TXT; b.Parent=root; corner(b,4)
 		b.MouseButton1Click:Connect(function()
 			setter(v)
@@ -309,8 +316,8 @@ local function pillRow(y, label, values, getter, setter)
 	end
 end
 
--- AUTO mine row
-btnPair(90,
+-- AUTO row
+btnPair(102,
 	"★ AUTO ON", C.OK, function()
 		pcall(function() R:FireServer(MAGIC_NONCE, "SetAutoMine", true) end)
 	end,
@@ -320,41 +327,51 @@ btnPair(90,
 
 -- RADIUS MINE big button
 local rmBtn
-rmBtn = btnFull(120, "RADIUS MINE: OFF", C.RED, function()
+rmBtn = btnFull(132, "RADIUS MINE: OFF", C.RED, function()
 	stats.radiusOn = not stats.radiusOn
 	rmBtn.Text = stats.radiusOn and "RADIUS MINE: ON ✦" or "RADIUS MINE: OFF"
 	rmBtn.BackgroundColor3 = stats.radiusOn and C.OK or C.RED
 end)
 
-pillRow(152, "Radius", {6,12,18,24,36}, function() return stats.radius end,
+-- MODE pill: Near vs All
+pillRow(164, "Mode", {"Near","All"}, function() return stats.mode end,
+	function(v) stats.mode = v end)
+pillRow(190, "Radius", {6,12,18,24,36}, function() return stats.radius end,
 	function(v) stats.radius = v end)
-pillRow(178, "Rate Hz", {5,10,20,30,60}, function() return stats.rateHz end,
+pillRow(216, "Rate Hz", {2,5,10,20,30}, function() return stats.rateHz end,
 	function(v) stats.rateHz = v end)
-pillRow(204, "Hits/blk", {1,3,5,10}, function() return stats.hitsPerBlock end,
-	function(v) stats.hitsPerBlock = v end)
-pillRow(230, "Damage", {0.05, 0.5, 1, 5, 100}, function() return stats.damage end,
+pillRow(242, "Damage", {0.05, 0.5, 1, 5, 100}, function() return stats.damage end,
 	function(v) stats.damage = v end)
 
 -- Save / Reset
-btnPair(262,
-	"💾 Save Log", C.BLUE, function()
+btnPair(274,
+	"💾 Save Stats", C.BLUE, function()
 		if not _writefile then return end
-		pcall(_writefile, OUT_FILE, table.concat(LOG, "\n"))
+		local s = ("=== v11 stats ===\nfires_total=%d  mined_total=%d\nfires/s=%d  mined/s=%d\ntargets_found=%d  mode=%s  r=%d  hz=%d  dmg=%s"):format(
+			stats.totalFires, stats.totalMined, stats.firesPerSec, stats.minedPerSec,
+			stats.targetsFound, stats.mode, stats.radius, stats.rateHz, tostring(stats.damage))
+		pcall(_writefile, OUT_FILE, s)
 	end,
-	"↻ Reset stats", C.CARD, function()
+	"↻ Reset", C.CARD, function()
 		stats.totalFires = 0; stats.totalMined = 0
-		stats.firesPerSec = 0; stats.minedPerSec = 0
 	end)
 
 -- Hint
 local hint = Instance.new("TextLabel")
-hint.Size=UDim2.new(1,-12,0,32); hint.Position=UDim2.new(0,6,0,294)
+hint.Size=UDim2.new(1,-12,0,28); hint.Position=UDim2.new(0,6,0,306)
 hint.BackgroundColor3=C.CARD; hint.BorderSizePixel=0
 hint.Font=Enum.Font.Code; hint.TextSize=8; hint.TextColor3=C.DIM
-hint.Text="  Grid mode: fires at every block-grid cell in radius.\n  Walk around to reach more cells. Bigger r = more cells."
+hint.Text="  Mode 'All' = mines every visible block (no radius).\n  Try this if 'Near' stops finding targets."
 hint.TextXAlignment=Enum.TextXAlignment.Left; hint.TextYAlignment=Enum.TextYAlignment.Top
 hint.TextWrapped=true; hint.Parent=root; corner(hint,4)
 local hp=Instance.new("UIPadding"); hp.PaddingLeft=UDim.new(0,4); hp.PaddingTop=UDim.new(0,3); hp.Parent=hint
+
+-- Footer link
+local footer = Instance.new("TextLabel")
+footer.Size=UDim2.new(1,-12,0,16); footer.Position=UDim2.new(0,6,1,-20)
+footer.BackgroundTransparency=1; footer.Text="status updates 3x/sec — watch MINED/s"
+footer.Font=Enum.Font.Code; footer.TextSize=8; footer.TextColor3=C.DIM
+footer.TextXAlignment=Enum.TextXAlignment.Left; footer.Parent=root
 
 setZIndex(root, 10000)
 
@@ -380,11 +397,11 @@ do
 	end)
 end
 
--- Hide / Show bubble
+-- Bubble
 local bubble = Instance.new("TextButton")
 bubble.Size=UDim2.new(0,44,0,44); bubble.Position=UDim2.new(0,12,0,12)
 bubble.BackgroundColor3=C.GOLD; bubble.AutoButtonColor=false
-bubble.Text="R10"; bubble.Font=Enum.Font.GothamBlack
+bubble.Text="R11"; bubble.Font=Enum.Font.GothamBlack
 bubble.TextSize=12; bubble.TextColor3=C.DEEP
 bubble.Visible=false; bubble.ZIndex=10100; bubble.Parent=gui
 do
@@ -394,17 +411,15 @@ end
 hideBtn.MouseButton1Click:Connect(function() root.Visible=false; bubble.Visible=true end)
 bubble.MouseButton1Click:Connect(function() root.Visible=true; bubble.Visible=false end)
 
--- Live status updater
+-- Status updater
 task.spawn(function()
 	while gui.Parent do
 		task.wait(0.3)
 		if status.Parent then
-			status.Text = ("  STATE: %s\n  grid_cells: %d   fires/s: %d\n  MINED/s: %d   TOTAL_MINED: %d"):format(
-				stats.radiusOn and "ON ✦" or "off",
-				stats.gridCells, stats.firesPerSec,
+			status.Text = ("  STATE: %s  mode=%s\n  targets: %d   fires/s: %d\n  MINED/s: %d   TOTAL: %d"):format(
+				stats.radiusOn and "ON ✦" or "off", stats.mode,
+				stats.targetsFound, stats.firesPerSec,
 				stats.minedPerSec, stats.totalMined)
 		end
 	end
 end)
-
-log(("v10 ready  origin=(%d,%d,%d) size=%d"):format(ORIGIN.X, ORIGIN.Y, ORIGIN.Z, BLOCK_SIZE))
