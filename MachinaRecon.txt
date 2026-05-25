@@ -1,22 +1,23 @@
 --!nocheck
 -- ============================================================
--- MACHINA RECON v4 — MINIMAL OVERHEAD
+-- MACHINA RECON v5  —  anti-cheat aware
 -- Branch: claude/rare-indicator-auto-aim-mC8LF
--- File:   MachinaRecon.txt   (your loadstring URL stays the same)
+-- File:   MachinaRecon.txt
 --
--- FIXES FROM v3:
---   - Hook does ZERO serialization by default (just counts).
---     The expensive hex-dump only happens when you tap "Capture Next 5",
---     and stops automatically after 5 calls. So your game's Auto button
---     keeps working normally.
---   - Log shows INSIDE THE GUI (scrolling textbox) so you can read it
---     even if writefile is broken on your phone.
---   - "Test Write" button proves whether file save works at all,
---     with visible error if it doesn't.
---   - "Disable Hook" button — lets you confirm the hook isn't the cause.
+-- ⚠ DISCOVERY FROM v4 LOG:
+--   The game hooks print()/warn() and forwards every line to the
+--   server via a 10-byte encoded FireServer command. Any printed
+--   text gets reported as cheater telemetry.
+--
+-- v5 CHANGES:
+--   - ZERO print() / warn() / error() calls. Logs stay in memory + GUI.
+--   - Capture is DamageBlockSmooth-specific (mine call only). Won't
+--     get burned by background polls.
+--   - Captures DON'T also re-log themselves into the in-memory log
+--     (which the game then sends back to server). Buffers are stored
+--     in a separate table, shown only in the GUI's capture panel.
+--   - Auto-mine toggle confirmed working (SetAutoMine|true). Big OK button.
 -- ============================================================
-
-print("[Recon v4] loading")
 
 local Players          = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -28,7 +29,7 @@ local OUT_FILE    = "MachinaRecon.txt"
 local MAGIC_NONCE = string.char(255,255,255,255)
 
 -- ============================================================
--- ENV PROBE — find writefile via multiple paths
+-- ENV PROBE (silent)
 -- ============================================================
 local function find(n)
 	local v = rawget(_G, n); if v then return v end
@@ -42,72 +43,52 @@ local _appendfile = find("appendfile")
 local _isfile     = find("isfile")
 
 -- ============================================================
--- IN-MEMORY LOG  (we always have this even if file save fails)
+-- IN-MEMORY LOG (no print — anti-cheat reads print output)
 -- ============================================================
 local LOG_LINES = {}
-local LOG_MAX = 400
+local LOG_MAX = 300
 local function log(s)
-	s = tostring(s)
-	table.insert(LOG_LINES, s)
+	table.insert(LOG_LINES, tostring(s))
 	if #LOG_LINES > LOG_MAX then table.remove(LOG_LINES, 1) end
-	print("[R4] " .. s)
-end
-
-local function logHeader()
-	log(("===== RECON v4  %s ====="):format(os.date("%H:%M:%S")))
-	log(("writefile=%s readfile=%s appendfile=%s"):format(
-		tostring(_writefile~=nil), tostring(_readfile~=nil), tostring(_appendfile~=nil)))
-	log(("Player: %s  PlaceId: %d"):format(LocalPlayer.Name, game.PlaceId))
 end
 
 -- ============================================================
--- BYTE HELPERS
+-- HEX
 -- ============================================================
 local function strHex(s, max)
 	max = max or 64
 	local n = math.min(#s, max)
 	local out = {}
 	for i = 1, n do out[i] = string.format("%02x", string.byte(s, i)) end
-	local hex = table.concat(out, " ")
-	if #s > n then hex = hex .. (" ...+%d"):format(#s - n) end
-	return hex
+	local h = table.concat(out, " ")
+	if #s > n then h = h .. (" ...+%d"):format(#s - n) end
+	return h
+end
+local function bufRaw(b)
+	local ok, raw = pcall(buffer.tostring, b)
+	if ok and type(raw) == "string" then return raw end
+	return nil
 end
 local function bufHex(b, max)
-	max = max or 96
-	local ok, raw = pcall(buffer.tostring, b)
-	if ok and type(raw) == "string" then return strHex(raw, max), #raw end
-	return "<unreadable>", 0
-end
-
--- Serialize ONE arg compactly. No deep tables, no work for instances.
-local function sarg(v)
-	local t = typeof(v)
-	if t == "string" then
-		local p = v:gsub("[%c\128-\255]", ".")
-		return ("\"%s\"(hex=%s)"):format(p, strHex(v, 8))
-	elseif t == "buffer" then
-		local hex, n = bufHex(v); return ("<buf len=%d %s>"):format(n, hex)
-	elseif t == "Instance" then
-		local fn = ""; pcall(function() fn = v:GetFullName() end); return "<"..t..":"..fn..">"
-	elseif t == "Vector3" then return ("V3(%.0f,%.0f,%.0f)"):format(v.X,v.Y,v.Z)
-	elseif t == "boolean" or t == "number" or t == "nil" then return tostring(v)
-	elseif t == "table" then return "<table>"  -- skip; too risky for perf
-	else return "<"..t..">" end
+	local raw = bufRaw(b)
+	if not raw then return "<unreadable>", 0 end
+	return strHex(raw, max or 200), #raw
 end
 
 -- ============================================================
--- COUNTERS
+-- STATE
 -- ============================================================
 local stats = {
 	totalFires = 0,
-	captureRemaining = 0,
-	hookEnabled = true,
+	mineFires = 0,
+	mineCaptureRemaining = 0,
 	markCount = 0,
-	cmds = {},  -- [commandName] = count
+	hookEnabled = true,
 }
+local CAPTURED_MINES = {}  -- {hex, len, nonceHex, time}
 
 -- ============================================================
--- HOOK — minimal work by default
+-- HOOK — counts only by default
 -- ============================================================
 pcall(function()
 	local mt = getrawmetatable(game)
@@ -121,16 +102,25 @@ pcall(function()
 			local method = getnamecallmethod and getnamecallmethod() or ""
 			if method == "FireServer" or method == "InvokeServer" then
 				stats.totalFires = stats.totalFires + 1
-				local args = {...}
-				local cmd = type(args[2]) == "string" and args[2] or "?"
-				stats.cmds[cmd] = (stats.cmds[cmd] or 0) + 1
-				if stats.captureRemaining > 0 then
-					stats.captureRemaining = stats.captureRemaining - 1
-					-- ONLY here do we do heavy serialization
-					local parts = {}
-					for i = 1, select("#", ...) do parts[i] = sarg((select(i, ...))) end
-					log(("[CAP %d] cmd=%s args=%s"):format(
-						stats.totalFires, cmd, table.concat(parts, " | ")))
+				local a1 = select(1, ...)
+				local a2 = select(2, ...)
+				if type(a2) == "string" and a2 == "DamageBlockSmooth" then
+					stats.mineFires = stats.mineFires + 1
+					if stats.mineCaptureRemaining > 0 then
+						stats.mineCaptureRemaining = stats.mineCaptureRemaining - 1
+						local a3 = select(3, ...)
+						local hex, len = "?", 0
+						if typeof(a3) == "buffer" then hex, len = bufHex(a3, 256) end
+						local nhex = type(a1) == "string" and strHex(a1, 8) or "?"
+						table.insert(CAPTURED_MINES, {
+							idx = #CAPTURED_MINES + 1,
+							hex = hex,
+							len = len,
+							nonce = nhex,
+							t = tick(),
+							fireNo = stats.totalFires,
+						})
+					end
 				end
 			end
 		end
@@ -138,8 +128,10 @@ pcall(function()
 	end)
 	pcall(setRO, mt, true)
 end)
-logHeader()
-log("hook installed (idle — taps Capture to log args)")
+
+log(("===== RECON v5  %s ====="):format(os.date("%H:%M:%S")))
+log(("writefile=%s appendfile=%s"):format(tostring(_writefile~=nil), tostring(_appendfile~=nil)))
+log("hook installed (counts only — Capture button to dump mine buffers)")
 
 -- ============================================================
 -- UI
@@ -155,11 +147,11 @@ local C = {
 local function corner(o,r) local c=Instance.new("UICorner") c.CornerRadius=UDim.new(0,r or 6) c.Parent=o end
 local function stroke(o,col,t) local s=Instance.new("UIStroke") s.Color=col s.Thickness=t or 1 s.Parent=o end
 
-local old = PlayerGui:FindFirstChild("MachinaReconV4")
+local old = PlayerGui:FindFirstChild("MachinaReconV5")
 if old then old:Destroy() end
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "MachinaReconV4"
+gui.Name = "MachinaReconV5"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -167,8 +159,8 @@ gui.DisplayOrder = 9999
 gui.Parent = PlayerGui
 
 local root = Instance.new("Frame")
-root.Size = UDim2.new(0, 280, 0, 520)
-root.Position = UDim2.new(0, 16, 0.5, -260)
+root.Size = UDim2.new(0, 290, 0, 560)
+root.Position = UDim2.new(0, 16, 0.5, -280)
 root.BackgroundColor3 = C.BG
 root.BorderSizePixel = 0
 root.Active = true
@@ -181,7 +173,6 @@ local function setZIndex(p, z)
 	for _, c in ipairs(p:GetChildren()) do setZIndex(c, z) end
 end
 
--- Title bar
 local titleBar = Instance.new("Frame")
 titleBar.Size=UDim2.new(1,0,0,30); titleBar.BackgroundColor3=C.DEEP
 titleBar.BorderSizePixel=0; titleBar.Parent=root; corner(titleBar,10)
@@ -193,13 +184,12 @@ stripe.Position=UDim2.new(0,8,0,5); stripe.BackgroundColor3=C.PINK
 stripe.BorderSizePixel=0; stripe.Parent=titleBar; corner(stripe,2)
 local titleLbl=Instance.new("TextLabel"); titleLbl.Size=UDim2.new(1,-20,1,0)
 titleLbl.Position=UDim2.new(0,18,0,0); titleLbl.BackgroundTransparency=1
-titleLbl.Text="RECON v4"; titleLbl.Font=Enum.Font.GothamBlack
+titleLbl.Text="RECON v5"; titleLbl.Font=Enum.Font.GothamBlack
 titleLbl.TextSize=11; titleLbl.TextColor3=C.TXT
 titleLbl.TextXAlignment=Enum.TextXAlignment.Left; titleLbl.Parent=titleBar
 
--- Status
 local status=Instance.new("TextLabel")
-status.Size=UDim2.new(1,-16,0,30); status.Position=UDim2.new(0,8,0,36)
+status.Size=UDim2.new(1,-16,0,28); status.Position=UDim2.new(0,8,0,36)
 status.BackgroundColor3=C.CARD; status.BorderSizePixel=0
 status.Font=Enum.Font.Code; status.TextSize=10; status.TextColor3=C.OK
 status.Text="  ready"; status.TextXAlignment=Enum.TextXAlignment.Left
@@ -207,10 +197,11 @@ status.TextWrapped=true; status.Parent=root; corner(status,6)
 local sp=Instance.new("UIPadding"); sp.PaddingTop=UDim.new(0,4)
 sp.PaddingLeft=UDim.new(0,6); sp.Parent=status
 
--- BUTTONS
+local R = ReplicatedStorage:WaitForChild("RemoteEvent")
+
 local function btn(y, text, color, click)
 	local b = Instance.new("TextButton")
-	b.Size=UDim2.new(1,-16,0,28); b.Position=UDim2.new(0,8,0,y)
+	b.Size=UDim2.new(1,-16,0,30); b.Position=UDim2.new(0,8,0,y)
 	b.BackgroundColor3=color; b.AutoButtonColor=false
 	b.Text=text; b.Font=Enum.Font.GothamBold; b.TextSize=11
 	b.TextColor3=C.TXT; b.Parent=root; corner(b,6)
@@ -218,95 +209,104 @@ local function btn(y, text, color, click)
 	return b
 end
 
-local R = ReplicatedStorage:WaitForChild("RemoteEvent")
+-- AUTO TOGGLE  (CONFIRMED WORKING)
+btn( 70, "★ AUTO MINE ON", C.OK, function()
+	pcall(function() R:FireServer(MAGIC_NONCE, "SetAutoMine", true) end)
+	log("→ SetAutoMine TRUE sent")
+end)
+btn(104, "■ AUTO MINE OFF", C.RED, function()
+	pcall(function() R:FireServer(MAGIC_NONCE, "SetAutoMine", false) end)
+	log("→ SetAutoMine FALSE sent")
+end)
+
+-- CAPTURE MINE BUFFERS
+btn(138, "📸 Capture Next 5 MINES", C.PURPLE, function()
+	stats.mineCaptureRemaining = 5
+	-- clear previous so panel only shows fresh
+	for i = #CAPTURED_MINES, 1, -1 do table.remove(CAPTURED_MINES, i) end
+	log("CAPTURE armed: next 5 DamageBlockSmooth")
+end)
 
 local hookBtn
-local captureBtn
-local fileBtn
-
-btn(74, "★ Try AUTO MINE ON", C.OK, function()
-	log("ME→ FireServer SetAutoMine TRUE")
-	local ok, err = pcall(function() R:FireServer(MAGIC_NONCE, "SetAutoMine", true) end)
-	if not ok then log("  ERR: "..tostring(err)) end
-end)
-
-btn(106, "■ Try AUTO MINE OFF", C.RED, function()
-	log("ME→ FireServer SetAutoMine FALSE")
-	pcall(function() R:FireServer(MAGIC_NONCE, "SetAutoMine", false) end)
-end)
-
-captureBtn = btn(138, "📸 Capture Next 5 fires", C.BLUE, function()
-	stats.captureRemaining = 5
-	log("CAPTURE armed for next 5 FireServer calls")
-end)
-
-hookBtn = btn(170, "Hook: ON (tap to disable)", C.WARN, function()
+hookBtn = btn(172, "Hook: ON (tap to disable)", C.WARN, function()
 	stats.hookEnabled = not stats.hookEnabled
-	hookBtn.Text = stats.hookEnabled and "Hook: ON (tap to disable)" or "Hook: OFF (game raw)"
+	hookBtn.Text = stats.hookEnabled and "Hook: ON (tap to disable)" or "Hook: OFF"
 	hookBtn.BackgroundColor3 = stats.hookEnabled and C.WARN or C.CARD
-	log("hook " .. (stats.hookEnabled and "ENABLED" or "DISABLED"))
 end)
 
-fileBtn = btn(202, "💾 Test Write + Save Log", C.PURPLE, function()
-	if not _writefile then
-		log("ERR: writefile() does not exist in this exec env")
-		fileBtn.Text = "✗ no writefile"; return
+local fileBtn
+fileBtn = btn(206, "💾 Save Log to File", C.BLUE, function()
+	if not _writefile then fileBtn.Text="✗ no writefile"; return end
+	-- Build a full report from in-memory log + captures
+	local lines = {}
+	for _, l in ipairs(LOG_LINES) do lines[#lines+1] = l end
+	lines[#lines+1] = ""
+	lines[#lines+1] = "===== CAPTURED MINE BUFFERS ====="
+	for _, c in ipairs(CAPTURED_MINES) do
+		lines[#lines+1] = ("[#%d fire=%d] nonce=%s len=%d"):format(
+			c.idx, c.fireNo, c.nonce, c.len)
+		lines[#lines+1] = "  hex: " .. c.hex
 	end
-	local payload = table.concat(LOG_LINES, "\n")
+	local payload = table.concat(lines, "\n")
 	local ok, err = pcall(_writefile, OUT_FILE, payload)
 	if not ok then
 		log("ERR writefile: " .. tostring(err))
-		fileBtn.Text = "✗ write FAILED"; return
+		fileBtn.Text = "✗ FAIL"; return
 	end
-	-- Read it back to verify
-	local back = nil
-	if _readfile then
-		local ok2, r = pcall(_readfile, OUT_FILE)
-		if ok2 then back = r end
-	end
-	if back == payload then
-		log(("✓ wrote %d bytes to %s, verified"):format(#payload, OUT_FILE))
-		fileBtn.Text = ("✓ saved %d bytes"):format(#payload)
-	elseif back then
-		log(("? wrote but readback differs (read %d bytes)"):format(#back))
-		fileBtn.Text = "? wrote but mismatch"
-	else
-		log(("? wrote but cannot read back"))
-		fileBtn.Text = "? wrote, no read"
-	end
-	task.delay(3, function() if fileBtn.Parent then fileBtn.Text = "💾 Test Write + Save Log" end end)
+	fileBtn.Text = ("✓ saved %d bytes"):format(#payload)
+	task.delay(2.5, function() if fileBtn.Parent then fileBtn.Text = "💾 Save Log to File" end end)
 end)
 
-btn(234, "Mark MANUAL MINE", C.BLUE, function()
+btn(240, "MARK manual mine", C.BLUE, function()
 	stats.markCount = stats.markCount + 1
 	log(("=== MARK #%d MANUAL_MINE fires=%d ==="):format(stats.markCount, stats.totalFires))
 end)
-btn(266, "Mark AUTO BUTTON", C.PINK, function()
-	stats.markCount = stats.markCount + 1
-	log(("=== MARK #%d AUTO_BTN fires=%d ==="):format(stats.markCount, stats.totalFires))
-end)
 
--- LOG VIEW (scrolling text)
+-- ============================================================
+-- CAPTURE PANEL — shows the buffers we've grabbed
+-- ============================================================
+local capTitle = Instance.new("TextLabel")
+capTitle.Size=UDim2.new(1,-16,0,16); capTitle.Position=UDim2.new(0,8,0,278)
+capTitle.BackgroundTransparency=1; capTitle.Text="CAPTURED MINE BUFFERS"
+capTitle.Font=Enum.Font.GothamBold; capTitle.TextSize=10
+capTitle.TextColor3=C.DIM; capTitle.TextXAlignment=Enum.TextXAlignment.Left
+capTitle.Parent=root
+
+local capFrame = Instance.new("ScrollingFrame")
+capFrame.Size=UDim2.new(1,-16,0,150); capFrame.Position=UDim2.new(0,8,0,296)
+capFrame.BackgroundColor3=C.DEEP; capFrame.BorderSizePixel=0
+capFrame.ScrollBarThickness=4; capFrame.AutomaticCanvasSize=Enum.AutomaticSize.Y
+capFrame.CanvasSize=UDim2.new(0,0,0,0)
+capFrame.ScrollBarImageColor3=C.DIM; capFrame.Parent=root; corner(capFrame,6)
+
+local capText = Instance.new("TextLabel")
+capText.Size=UDim2.new(1,-8,0,0); capText.Position=UDim2.new(0,4,0,4)
+capText.AutomaticSize=Enum.AutomaticSize.Y; capText.BackgroundTransparency=1
+capText.Font=Enum.Font.Code; capText.TextSize=9; capText.TextColor3=C.TXT
+capText.TextXAlignment=Enum.TextXAlignment.Left
+capText.TextYAlignment=Enum.TextYAlignment.Top
+capText.TextWrapped=true; capText.Text=" (mine a block after tapping Capture)"
+capText.Parent=capFrame
+
+-- LOG PANEL
 local logTitle = Instance.new("TextLabel")
-logTitle.Size=UDim2.new(1,-16,0,16); logTitle.Position=UDim2.new(0,8,0,302)
-logTitle.BackgroundTransparency=1; logTitle.Text="LIVE LOG"
+logTitle.Size=UDim2.new(1,-16,0,16); logTitle.Position=UDim2.new(0,8,0,452)
+logTitle.BackgroundTransparency=1; logTitle.Text="LOG (last 20 lines)"
 logTitle.Font=Enum.Font.GothamBold; logTitle.TextSize=10
 logTitle.TextColor3=C.DIM; logTitle.TextXAlignment=Enum.TextXAlignment.Left
 logTitle.Parent=root
 
 local logFrame = Instance.new("ScrollingFrame")
-logFrame.Size=UDim2.new(1,-16,1,-330); logFrame.Position=UDim2.new(0,8,0,322)
+logFrame.Size=UDim2.new(1,-16,1,-478); logFrame.Position=UDim2.new(0,8,0,470)
 logFrame.BackgroundColor3=C.DEEP; logFrame.BorderSizePixel=0
-logFrame.ScrollBarThickness=4; logFrame.CanvasSize=UDim2.new(0,0,0,0)
-logFrame.AutomaticCanvasSize=Enum.AutomaticSize.Y
-logFrame.ScrollBarImageColor3=C.DIM; logFrame.Parent=root
-corner(logFrame,6)
+logFrame.ScrollBarThickness=4; logFrame.AutomaticCanvasSize=Enum.AutomaticSize.Y
+logFrame.CanvasSize=UDim2.new(0,0,0,0)
+logFrame.ScrollBarImageColor3=C.DIM; logFrame.Parent=root; corner(logFrame,6)
 
 local logText = Instance.new("TextLabel")
 logText.Size=UDim2.new(1,-8,0,0); logText.Position=UDim2.new(0,4,0,4)
-logText.AutomaticSize=Enum.AutomaticSize.Y
-logText.BackgroundTransparency=1; logText.Font=Enum.Font.Code
-logText.TextSize=9; logText.TextColor3=C.TXT
+logText.AutomaticSize=Enum.AutomaticSize.Y; logText.BackgroundTransparency=1
+logText.Font=Enum.Font.Code; logText.TextSize=9; logText.TextColor3=C.TXT
 logText.TextXAlignment=Enum.TextXAlignment.Left
 logText.TextYAlignment=Enum.TextYAlignment.Top
 logText.TextWrapped=true; logText.Text=""; logText.Parent=logFrame
@@ -340,27 +340,29 @@ task.spawn(function()
 	while gui.Parent do
 		task.wait(0.4)
 		if status.Parent then
-			local top3 = {}
-			local pairs_arr = {}
-			for k, v in pairs(stats.cmds) do table.insert(pairs_arr, {k, v}) end
-			table.sort(pairs_arr, function(a, b) return a[2] > b[2] end)
-			for i = 1, math.min(3, #pairs_arr) do
-				table.insert(top3, pairs_arr[i][1].."("..pairs_arr[i][2]..")")
-			end
-			status.Text = ("fires=%d cap=%d mark=%d  top: %s"):format(
-				stats.totalFires, stats.captureRemaining, stats.markCount,
-				table.concat(top3, " "))
+			status.Text = ("fires=%d mines=%d cap_left=%d marks=%d"):format(
+				stats.totalFires, stats.mineFires,
+				stats.mineCaptureRemaining, stats.markCount)
 		end
 		if logText.Parent then
-			-- show last 30 lines
-			local start = math.max(1, #LOG_LINES - 30)
+			local start = math.max(1, #LOG_LINES - 20)
 			local arr = {}
 			for i = start, #LOG_LINES do arr[#arr+1] = LOG_LINES[i] end
 			logText.Text = table.concat(arr, "\n")
-			-- auto scroll to bottom
-			logFrame.CanvasPosition = Vector2.new(0, logText.AbsoluteSize.Y)
+		end
+		if capText.Parent then
+			if #CAPTURED_MINES == 0 then
+				capText.Text = " (tap Capture, then mine a block)"
+			else
+				local arr = {}
+				for _, c in ipairs(CAPTURED_MINES) do
+					arr[#arr+1] = ("#%d  fire=%d  nonce=%s  len=%d"):format(
+						c.idx, c.fireNo, c.nonce, c.len)
+					arr[#arr+1] = "  " .. c.hex
+					arr[#arr+1] = ""
+				end
+				capText.Text = table.concat(arr, "\n")
+			end
 		end
 	end
 end)
-
-print("[Recon v4] ready")
