@@ -1,54 +1,89 @@
 --!nocheck
 -- ============================================================
--- MACHINA RECON  —  Remote dumper + live fire/invoke logger
--- Delta-compatible.  Saves to:  Delta/Workspace/MachinaRecon.txt
+-- MACHINA RECON FULL  —  Mining + Auto reverse-engineering kit
+-- Delta-compatible. Single output file: MachinaRecon.txt
+-- (in Delta's Workspace folder)
+--
+-- WHAT IT CAPTURES:
+--   1. Inventory of every RemoteEvent / RemoteFunction / Bindable
+--   2. Full Tool dump (Backpack, StarterPack, Character) with
+--      LocalScript source DECOMPILED inline
+--   3. All ScreenGuis in PlayerGui + their script sources
+--      (the Auto button UI lives here)
+--   4. Mining-related ModuleScripts in ReplicatedStorage with source
+--   5. Live [FIRE] log of every FireServer / InvokeServer call
+--   6. Marker buttons so you can label each action in the log
 --
 -- HOW TO USE:
---   1. Execute this script.
---   2. A tiny pink panel appears (drag it anywhere).
---   3. Tap "MARK + Auto" right BEFORE you click the Machina
---      Relic's Auto button. Then click Auto.
---   4. Wait ~3-5 seconds so remote traffic gets captured.
---   5. Tap "SAVE" (it auto-saves too, this just force-flushes).
---   6. Open Delta's file manager → Workspace → MachinaRecon.txt
---      → share/upload here.
+--   1. Execute the script in-game with a pickaxe / Machina Relic
+--      in your inventory.
+--   2. Wait ~5 seconds for the initial dump (it decompiles scripts).
+--   3. Use the marker buttons IN THIS ORDER and do the action
+--      AFTER tapping the marker:
+--        ▸ Tap "MARK: MANUAL MINE", then mine ONE block manually
+--        ▸ Tap "MARK: AUTO ON",    then click Machina Relic Auto
+--        ▸ Wait 5-10s for auto to fire several times
+--        ▸ Tap "MARK: AUTO OFF",   then turn Auto off
+--        ▸ Tap "MARK: SELL",       then sell/walk into seller
+--   4. Tap "SAVE" to force a final flush.
+--   5. Open Delta → file manager → Workspace → MachinaRecon.txt
+--      → upload here.
 -- ============================================================
 
 local Players          = game:GetService("Players")
 local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage= game:GetService("ReplicatedStorage")
+local StarterPack      = game:GetService("StarterPack")
+local StarterPlayer    = game:GetService("StarterPlayer")
 local TweenService     = game:GetService("TweenService")
-local HttpService      = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
 
 -- ============================================================
--- FILESYSTEM (Delta exposes writefile/appendfile/isfile)
+-- CONFIG
 -- ============================================================
-local OUT_FILE = "MachinaRecon.txt"
+local OUT_FILE        = "MachinaRecon.txt"
+local MAX_SRC_BYTES   = 60000   -- truncate huge sources
+local DECOMPILE_TIME  = 4       -- seconds per decompile attempt
 
-local _writefile  = rawget(getfenv(), "writefile")  or writefile
-local _appendfile = rawget(getfenv(), "appendfile") or appendfile
-local _readfile   = rawget(getfenv(), "readfile")   or readfile
-local _isfile     = rawget(getfenv(), "isfile")     or isfile
+-- Keywords used to flag relevant remotes/modules/scripts
+local KEYWORDS = {
+	"mine", "machina", "relic", "auto", "break", "hit",
+	"swing", "dig", "ore", "block", "pickaxe", "tool",
+	"sell", "inventory", "currency", "coin", "shop",
+	"activate", "use", "equip", "cooldown",
+}
+
+-- ============================================================
+-- FS (Delta: writefile / appendfile / readfile / isfile)
+-- ============================================================
+local function get(n) return rawget(getfenv(0), n) or rawget(_G, n) end
+local _writefile  = writefile  or get("writefile")
+local _appendfile = appendfile or get("appendfile")
+local _readfile   = readfile   or get("readfile")
+local _isfile     = isfile     or get("isfile")
+
+local _decompile  = decompile  or get("decompile")
+local _getscripts = getscripts or get("getscripts") or get("get_scripts")
+local _getloaded  = getloadedmodules or get("getloadedmodules") or get("get_loaded_modules")
+local _getbyte    = getscriptbytecode or get("getscriptbytecode")
 
 if not _writefile then
-	warn("[Recon] No writefile() — this executor cannot save files.")
+	warn("[Recon] No writefile() — Delta needed.")
 end
 
-local _buffer = {}
-local _saving = false
+local _buf, _saving = {}, false
 local function flush()
-	if _saving or #_buffer == 0 then return end
+	if _saving or #_buf == 0 or not _writefile then return end
 	_saving = true
-	local chunk = table.concat(_buffer, "\n") .. "\n"
-	_buffer = {}
+	local chunk = table.concat(_buf, "\n") .. "\n"
+	_buf = {}
 	pcall(function()
 		if _appendfile and _isfile and _isfile(OUT_FILE) then
 			_appendfile(OUT_FILE, chunk)
-		elseif _writefile then
+		else
 			local prev = ""
 			if _readfile and _isfile and _isfile(OUT_FILE) then
 				prev = _readfile(OUT_FILE) or ""
@@ -60,55 +95,105 @@ local function flush()
 end
 
 local function log(line)
-	table.insert(_buffer, line)
-	if #_buffer >= 8 then flush() end
+	table.insert(_buf, line)
+	if #_buf >= 20 then flush() end
 end
 
--- Wipe previous log on each run so it doesn't grow forever
+-- wipe file on each run
 if _writefile then pcall(function() _writefile(OUT_FILE, "") end) end
 
--- Periodic flush
 task.spawn(function()
-	while true do
-		task.wait(1.5)
-		flush()
-	end
+	while true do task.wait(1.5); flush() end
 end)
 
 -- ============================================================
--- ARG SERIALIZER  (handles Instance / Vector3 / CFrame / tables)
+-- HELPERS
 -- ============================================================
-local function ser(v, depth)
-	depth = depth or 0
-	if depth > 3 then return "<deep>" end
+local function flag(s)
+	if type(s) ~= "string" then return false end
+	local low = s:lower()
+	for _, k in ipairs(KEYWORDS) do
+		if low:find(k, 1, true) then return true end
+	end
+	return false
+end
+
+local function banner(title)
+	log("")
+	log("################################################################")
+	log("###  " .. title)
+	log("################################################################")
+end
+
+local function section(title)
+	log("")
+	log("----- " .. title .. " -----")
+end
+
+local function tryDecompile(s)
+	if not _decompile then return nil, "no-decompile" end
+	local done, src, err = false, nil, nil
+	task.spawn(function()
+		local ok, res = pcall(_decompile, s)
+		if ok then src = res else err = tostring(res) end
+		done = true
+	end)
+	local t0 = tick()
+	while not done and (tick() - t0) < DECOMPILE_TIME do task.wait(0.1) end
+	if not done then return nil, "timeout" end
+	if not src or src == "" then return nil, err or "empty" end
+	if #src > MAX_SRC_BYTES then
+		src = src:sub(1, MAX_SRC_BYTES) .. "\n-- [TRUNCATED at " .. MAX_SRC_BYTES .. " bytes] --"
+	end
+	return src
+end
+
+local function dumpScriptSource(s, indent)
+	indent = indent or ""
+	local src, err = tryDecompile(s)
+	if not src then
+		log(indent .. "  -- <decompile failed: " .. tostring(err) .. ">")
+		-- fallback: try bytecode (rare but useful)
+		if _getbyte then
+			local ok, bc = pcall(_getbyte, s)
+			if ok and bc and #bc > 0 then
+				log(indent .. "  -- bytecode size: " .. #bc .. " bytes")
+			end
+		end
+		return
+	end
+	log(indent .. "  >>>>>>> SOURCE >>>>>>>")
+	for line in src:gmatch("([^\n]*)\n?") do
+		log(indent .. line)
+	end
+	log(indent .. "  <<<<<<< END SOURCE <<<<<<<")
+end
+
+-- ============================================================
+-- SERIALIZER for remote args
+-- ============================================================
+local function ser(v, d)
+	d = d or 0
+	if d > 3 then return "<deep>" end
 	local t = typeof(v)
 	if t == "Instance" then
 		local cls, fn = "?", "?"
 		pcall(function() cls = v.ClassName end)
 		pcall(function() fn  = v:GetFullName() end)
 		return ("<%s:%s>"):format(cls, fn)
-	elseif t == "Vector3" then
-		return ("V3(%.1f,%.1f,%.1f)"):format(v.X, v.Y, v.Z)
-	elseif t == "Vector2" then
-		return ("V2(%.1f,%.1f)"):format(v.X, v.Y)
-	elseif t == "CFrame" then
-		local p = v.Position
-		return ("CF(%.1f,%.1f,%.1f)"):format(p.X, p.Y, p.Z)
-	elseif t == "Color3" then
-		return ("C3(%d,%d,%d)"):format(v.R*255, v.G*255, v.B*255)
-	elseif t == "EnumItem" then
-		return tostring(v)
-	elseif t == "string" then
-		return ("%q"):format(v)
-	elseif t == "number" or t == "boolean" or t == "nil" then
-		return tostring(v)
+	elseif t == "Vector3" then return ("V3(%.1f,%.1f,%.1f)"):format(v.X, v.Y, v.Z)
+	elseif t == "Vector2" then return ("V2(%.1f,%.1f)"):format(v.X, v.Y)
+	elseif t == "CFrame"  then local p = v.Position; return ("CF(%.1f,%.1f,%.1f)"):format(p.X, p.Y, p.Z)
+	elseif t == "Color3"  then return ("C3(%d,%d,%d)"):format(v.R*255, v.G*255, v.B*255)
+	elseif t == "EnumItem" then return tostring(v)
+	elseif t == "string" then return ("%q"):format(v)
+	elseif t == "number" or t == "boolean" or t == "nil" then return tostring(v)
 	elseif t == "table" then
-		local parts = {}
-		local count = 0
+		local parts, n = {}, 0
 		for k, vv in pairs(v) do
-			count = count + 1
-			if count > 16 then table.insert(parts, "...") break end
-			table.insert(parts, ("[%s]=%s"):format(ser(k, depth+1), ser(vv, depth+1)))
+			n = n + 1
+			if n > 16 then table.insert(parts, "..."); break end
+			table.insert(parts, ("[%s]=%s"):format(ser(k, d+1), ser(vv, d+1)))
 		end
 		return "{" .. table.concat(parts, ", ") .. "}"
 	end
@@ -116,38 +201,29 @@ local function ser(v, depth)
 end
 
 local function serArgs(...)
-	local n = select("#", ...)
-	local parts = {}
-	for i = 1, n do
-		parts[i] = ser((select(i, ...)))
-	end
+	local n, parts = select("#", ...), {}
+	for i = 1, n do parts[i] = ser((select(i, ...))) end
 	return table.concat(parts, " | ")
 end
 
 -- ============================================================
--- HEADER + INITIAL REMOTE INVENTORY
+-- HEADER
 -- ============================================================
-local KEYWORDS = {
-	"mine", "break", "hit", "auto", "machina", "relic",
-	"ore", "block", "dig", "pickaxe", "swing", "place",
-	"sell", "inventory", "use", "activate", "tool",
-}
-
-local function flag(name)
-	local low = name:lower()
-	for _, k in ipairs(KEYWORDS) do
-		if low:find(k, 1, true) then return true end
-	end
-	return false
-end
-
-log(("===== MACHINA RECON  %s ====="):format(os.date("%Y-%m-%d %H:%M:%S")))
+log(("===== MACHINA RECON FULL  %s ====="):format(os.date("%Y-%m-%d %H:%M:%S")))
 log(("PlaceId: %d   JobId: %s"):format(game.PlaceId, game.JobId or ""))
 log(("Player:  %s (uid %d)"):format(LocalPlayer.Name, LocalPlayer.UserId))
-log("")
+log(("Exec features: writefile=%s decompile=%s getscripts=%s getloaded=%s"):format(
+	tostring(_writefile ~= nil), tostring(_decompile ~= nil),
+	tostring(_getscripts ~= nil), tostring(_getloaded ~= nil)))
+flush()
 
-local function dumpRemotesIn(parent, label)
-	log(("----- REMOTES in %s -----"):format(label))
+-- ============================================================
+-- 1. REMOTE INVENTORY
+-- ============================================================
+banner("1. REMOTE INVENTORY")
+
+local function dumpRemotes(parent, label)
+	section("Remotes in " .. label)
 	local count, flagged = 0, 0
 	for _, d in ipairs(parent:GetDescendants()) do
 		if d:IsA("RemoteEvent") or d:IsA("RemoteFunction")
@@ -160,87 +236,182 @@ local function dumpRemotesIn(parent, label)
 		end
 	end
 	log(("(total %d, flagged %d)"):format(count, flagged))
-	log("")
+end
+dumpRemotes(ReplicatedStorage, "ReplicatedStorage")
+pcall(function() dumpRemotes(game:GetService("ReplicatedFirst"), "ReplicatedFirst") end)
+pcall(function() dumpRemotes(workspace, "Workspace") end)
+flush()
+
+-- ============================================================
+-- 2. TOOL DUMP  (Backpack + StarterPack + Character)
+-- ============================================================
+banner("2. TOOLS  (with full LocalScript source)")
+
+local function dumpTool(t, where)
+	section(("Tool [%s]  %s"):format(where, t.Name))
+	log("  Path: " .. t:GetFullName())
+	log("  Attributes:")
+	for k, v in pairs(t:GetAttributes()) do
+		log(("    @%s = %s"):format(k, ser(v)))
+	end
+	-- list everything inside
+	for _, child in ipairs(t:GetDescendants()) do
+		local cls = child.ClassName
+		if child:IsA("LocalScript") or child:IsA("ModuleScript") or child:IsA("Script") then
+			log(("  -- script: [%s] %s"):format(cls, child:GetFullName()))
+			dumpScriptSource(child, "    ")
+		elseif child:IsA("RemoteEvent") or child:IsA("RemoteFunction")
+			or child:IsA("BindableEvent") or child:IsA("BindableFunction") then
+			log(("  -- remote: [%s] %s"):format(cls, child:GetFullName()))
+		elseif child:IsA("ValueBase") then
+			local ok, val = pcall(function() return child.Value end)
+			log(("  -- value:  [%s] %s = %s"):format(cls, child.Name, ok and ser(val) or "?"))
+		elseif child:IsA("BasePart") or child:IsA("Folder") or child:IsA("Configuration") then
+			log(("  -- %s: %s"):format(cls, child.Name))
+		end
+	end
 end
 
-dumpRemotesIn(ReplicatedStorage, "ReplicatedStorage")
-pcall(function() dumpRemotesIn(game:GetService("ReplicatedFirst"), "ReplicatedFirst") end)
-pcall(function() dumpRemotesIn(workspace, "Workspace") end)
+local function dumpToolsIn(parent, label)
+	if not parent then return end
+	for _, c in ipairs(parent:GetChildren()) do
+		if c:IsA("Tool") then dumpTool(c, label) end
+	end
+end
+dumpToolsIn(LocalPlayer:FindFirstChild("Backpack"), "Backpack")
+dumpToolsIn(StarterPack, "StarterPack")
+if LocalPlayer.Character then dumpToolsIn(LocalPlayer.Character, "Character") end
+flush()
 
--- Look for the Machina Relic tool specifically
-log("----- TOOLS (Backpack + StarterPack + Character) -----")
-local function dumpTools(parent, label)
-	for _, t in ipairs(parent:GetChildren()) do
-		if t:IsA("Tool") then
-			log(("[Tool@%s] %s"):format(label, t.Name))
-			for _, child in ipairs(t:GetDescendants()) do
-				if child:IsA("LocalScript") or child:IsA("ModuleScript") or child:IsA("Script") then
-					log(("    └ %s  %s"):format(child.ClassName, child:GetFullName()))
-				elseif child:IsA("RemoteEvent") or child:IsA("RemoteFunction")
-					or child:IsA("BindableEvent") or child:IsA("BindableFunction") then
-					log(("    └ [%s] %s"):format(child.ClassName, child:GetFullName()))
+-- ============================================================
+-- 3. PLAYERGUI  (Auto button lives here)
+-- ============================================================
+banner("3. PlayerGui ScreenGuis  (with script source)")
+
+for _, g in ipairs(PlayerGui:GetChildren()) do
+	if g:IsA("ScreenGui") or g:IsA("Frame") then
+		section(("ScreenGui: %s"):format(g.Name))
+		log("  Path: " .. g:GetFullName())
+		for _, d in ipairs(g:GetDescendants()) do
+			if d:IsA("LocalScript") or d:IsA("ModuleScript") or d:IsA("Script") then
+				log(("  -- script: [%s] %s"):format(d.ClassName, d:GetFullName()))
+				dumpScriptSource(d, "    ")
+			elseif d:IsA("TextButton") or d:IsA("ImageButton") then
+				local txt = d:IsA("TextButton") and tostring(d.Text) or ""
+				if flag(d.Name) or flag(txt) then
+					log(("  -- button *** %s   text=%q  path=%s"):format(d.ClassName, txt, d:GetFullName()))
 				end
 			end
 		end
 	end
 end
-pcall(function() dumpTools(LocalPlayer:WaitForChild("Backpack"), "Backpack") end)
-pcall(function() dumpTools(game:GetService("StarterPack"), "StarterPack") end)
-if LocalPlayer.Character then dumpTools(LocalPlayer.Character, "Character") end
-log("")
-
--- Dump PlayerGui top-level ScreenGuis (the Auto button lives somewhere here)
-log("----- PlayerGui ScreenGuis -----")
-for _, g in ipairs(PlayerGui:GetChildren()) do
-	if g:IsA("ScreenGui") or g:IsA("Frame") then
-		log(("[%s] %s"):format(g.ClassName, g.Name))
-	end
-end
-log("")
-
-log("===== LIVE FIRE/INVOKE LOG STARTS BELOW =====")
-log("(Tap MARK before clicking Auto so we can find it in this log.)")
-log("")
 flush()
 
 -- ============================================================
--- HOOK NAMECALL  —  catches RemoteEvent:FireServer / RemoteFunction:InvokeServer
+-- 4. MINING-RELATED MODULESCRIPTS  (ReplicatedStorage + loaded)
 -- ============================================================
-local hookSetup = false
-local function setupHook()
-	if hookSetup then return end
+banner("4. Mining-related ModuleScripts (source decompiled)")
+
+local seenSrc = {}
+
+local function dumpModuleIfRelevant(m, why)
+	if seenSrc[m] then return end
+	seenSrc[m] = true
+	if not (m:IsA("ModuleScript") or m:IsA("LocalScript") or m:IsA("Script")) then return end
+	local path = m:GetFullName()
+	if not (flag(m.Name) or flag(path)) then return end
+	section(("[%s]  %s   (matched: %s)"):format(m.ClassName, path, why))
+	dumpScriptSource(m, "  ")
+end
+
+-- ReplicatedStorage descendants
+for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+	dumpModuleIfRelevant(d, "ReplicatedStorage")
+end
+
+-- StarterPlayerScripts / StarterCharacterScripts
+pcall(function()
+	for _, d in ipairs(StarterPlayer:GetDescendants()) do
+		dumpModuleIfRelevant(d, "StarterPlayer")
+	end
+end)
+
+-- PlayerScripts
+pcall(function()
+	local ps = LocalPlayer:FindFirstChild("PlayerScripts")
+	if ps then
+		for _, d in ipairs(ps:GetDescendants()) do
+			dumpModuleIfRelevant(d, "PlayerScripts")
+		end
+	end
+end)
+
+-- Loaded modules (catches ones loaded at runtime from non-obvious paths)
+if _getloaded then
+	for _, m in ipairs(_getloaded()) do
+		dumpModuleIfRelevant(m, "loaded-modules")
+	end
+end
+
+-- Scripts (loaded LocalScripts/Scripts)
+if _getscripts then
+	for _, m in ipairs(_getscripts()) do
+		dumpModuleIfRelevant(m, "all-scripts")
+	end
+end
+
+flush()
+
+-- ============================================================
+-- 5. LIVE FIRE/INVOKE LOG  (namecall hook)
+-- ============================================================
+banner("5. LIVE FIRE/INVOKE LOG")
+log("(Use the marker buttons to label sections of this log.)")
+log("")
+
+local fireCount, markCount = 0, 0
+
+local function appendFireLine(self, method, ...)
+	fireCount = fireCount + 1
+	pcall(function()
+		log(("[FIRE #%d] %s :%s(%s)"):format(
+			fireCount, self:GetFullName(), method, serArgs(...)))
+	end)
+end
+
+local function installHook()
 	local ok, mt = pcall(getrawmetatable, game)
 	if not ok or not mt then
-		log("!! Could not get raw metatable. Hook unavailable.")
-		flush(); return
+		log("!! getrawmetatable failed — no live log available")
+		return false
 	end
-	local setReadonly = setreadonly or make_writeable
-	local isReadonly  = isreadonly  or function() return true end
+	local setRO = setreadonly or make_writeable
+	local isRO  = isreadonly  or function() return true end
 	local newcc = newcclosure or function(f) return f end
+	if isRO(mt) then pcall(setRO, mt, false) end
 
-	if isReadonly(mt) then pcall(setReadonly, mt, false) end
-
-	local oldNamecall = mt.__namecall
+	local oldNC = mt.__namecall
 	mt.__namecall = newcc(function(self, ...)
 		local method = getnamecallmethod and getnamecallmethod() or ""
 		if method == "FireServer" or method == "InvokeServer"
 			or method == "fireServer" or method == "invokeServer" then
-			pcall(function()
-				log(("[FIRE] %s :%s(%s)"):format(self:GetFullName(), method, serArgs(...)))
-			end)
+			appendFireLine(self, method, ...)
 		end
-		return oldNamecall(self, ...)
+		return oldNC(self, ...)
 	end)
-	pcall(setReadonly, mt, true)
-	hookSetup = true
-	log("[Recon] Namecall hook installed.")
-	flush()
+	pcall(setRO, mt, true)
+	return true
 end
 
-setupHook()
+if installHook() then
+	log("[Recon] Namecall hook installed.")
+else
+	log("[Recon] Could not install namecall hook.")
+end
+flush()
 
 -- ============================================================
--- TINY UI  (drag, MARK, SAVE)
+-- 6. MARKER UI
 -- ============================================================
 local C = {
 	BG   = Color3.fromRGB(14, 19, 33),
@@ -251,21 +422,22 @@ local C = {
 	PINK = Color3.fromRGB(245, 90, 165),
 	OK   = Color3.fromRGB(80, 195, 130),
 	WARN = Color3.fromRGB(235, 175, 75),
+	BLUE = Color3.fromRGB(80, 150, 235),
 }
 
 local function corner(o, r) local c = Instance.new("UICorner") c.CornerRadius = UDim.new(0, r or 6) c.Parent = o end
 local function stroke(o, col, t) local s = Instance.new("UIStroke") s.Color = col s.Thickness = t or 1 s.Parent = o end
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "MachinaRecon"
+gui.Name = "MachinaReconFull"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.Parent = PlayerGui
 
 local root = Instance.new("Frame")
-root.Size = UDim2.new(0, 220, 0, 150)
-root.Position = UDim2.new(0, 16, 0.5, -75)
+root.Size = UDim2.new(0, 230, 0, 290)
+root.Position = UDim2.new(0, 16, 0.5, -145)
 root.BackgroundColor3 = C.BG
 root.BorderSizePixel = 0
 root.Active = true
@@ -289,7 +461,7 @@ stripe.Parent = titleBar; corner(stripe, 2)
 
 local tl = Instance.new("TextLabel")
 tl.Size = UDim2.new(1, -20, 1, 0); tl.Position = UDim2.new(0, 18, 0, 0)
-tl.BackgroundTransparency = 1; tl.Text = "RECON"
+tl.BackgroundTransparency = 1; tl.Text = "RECON FULL"
 tl.Font = Enum.Font.GothamBlack; tl.TextSize = 12
 tl.TextColor3 = C.TXT; tl.TextXAlignment = Enum.TextXAlignment.Left
 tl.Parent = titleBar
@@ -299,37 +471,41 @@ status.Size = UDim2.new(1, -16, 0, 28)
 status.Position = UDim2.new(0, 8, 0, 34)
 status.BackgroundColor3 = C.CARD; status.BorderSizePixel = 0
 status.Font = Enum.Font.Code; status.TextSize = 10
-status.TextColor3 = C.OK; status.Text = "  hook armed · 0 events"
+status.TextColor3 = C.OK; status.Text = "  initializing..."
 status.TextXAlignment = Enum.TextXAlignment.Left; status.TextWrapped = true
 status.Parent = root; corner(status, 6)
 
-local markCount = 0
-local fireCount = 0
-
-local mark = Instance.new("TextButton")
-mark.Size = UDim2.new(1, -16, 0, 34); mark.Position = UDim2.new(0, 8, 0, 70)
-mark.BackgroundColor3 = C.PINK; mark.AutoButtonColor = false
-mark.Text = "✦ MARK + Auto"; mark.Font = Enum.Font.GothamBlack
-mark.TextSize = 13; mark.TextColor3 = C.TXT
-mark.Parent = root; corner(mark, 8)
-mark.MouseButton1Click:Connect(function()
-	markCount = markCount + 1
-	log("")
-	log(("================ MARKER #%d  @  %.2fs  (USER TAPPED) ================")
-		:format(markCount, tick()))
-	log("")
-	flush()
-	mark.Text = ("✦ MARKED  #%d  — now click Auto"):format(markCount)
-	task.delay(2.5, function()
-		if mark.Parent then mark.Text = "✦ MARK + Auto" end
+local function makeMarkButton(layoutY, label, tag, color)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, -16, 0, 30); b.Position = UDim2.new(0, 8, 0, layoutY)
+	b.BackgroundColor3 = color; b.AutoButtonColor = false
+	b.Text = label; b.Font = Enum.Font.GothamBold
+	b.TextSize = 12; b.TextColor3 = C.TXT
+	b.Parent = root; corner(b, 6)
+	b.MouseButton1Click:Connect(function()
+		markCount = markCount + 1
+		log("")
+		log(("================ MARK #%d  [%s]  @  %.2fs  (fires so far: %d) ================")
+			:format(markCount, tag, tick(), fireCount))
+		log("")
+		flush()
+		local orig = b.Text
+		b.Text = "✓ now do: " .. tag
+		task.delay(2.5, function() if b.Parent then b.Text = orig end end)
 	end)
-end)
+	return b
+end
+
+makeMarkButton(70,  "▸ MARK: MANUAL MINE",  "MANUAL_MINE", C.BLUE)
+makeMarkButton(106, "▸ MARK: AUTO ON",      "AUTO_ON",     C.PINK)
+makeMarkButton(142, "▸ MARK: AUTO OFF",     "AUTO_OFF",    C.WARN)
+makeMarkButton(178, "▸ MARK: SELL",         "SELL",        Color3.fromRGB(120, 80, 200))
 
 local saveBtn = Instance.new("TextButton")
-saveBtn.Size = UDim2.new(0.5, -10, 0, 30); saveBtn.Position = UDim2.new(0, 8, 0, 112)
-saveBtn.BackgroundColor3 = C.CARD; saveBtn.AutoButtonColor = false
-saveBtn.Text = "SAVE"; saveBtn.Font = Enum.Font.GothamBold
-saveBtn.TextSize = 11; saveBtn.TextColor3 = C.TXT
+saveBtn.Size = UDim2.new(0.5, -10, 0, 32); saveBtn.Position = UDim2.new(0, 8, 0, 220)
+saveBtn.BackgroundColor3 = C.OK; saveBtn.AutoButtonColor = false
+saveBtn.Text = "SAVE"; saveBtn.Font = Enum.Font.GothamBlack
+saveBtn.TextSize = 12; saveBtn.TextColor3 = C.TXT
 saveBtn.Parent = root; corner(saveBtn, 6)
 saveBtn.MouseButton1Click:Connect(function()
 	flush()
@@ -337,40 +513,21 @@ saveBtn.MouseButton1Click:Connect(function()
 	task.delay(1.5, function() if saveBtn.Parent then saveBtn.Text = "SAVE" end end)
 end)
 
-local rescan = Instance.new("TextButton")
-rescan.Size = UDim2.new(0.5, -10, 0, 30); rescan.Position = UDim2.new(0.5, 2, 0, 112)
-rescan.BackgroundColor3 = C.CARD; rescan.AutoButtonColor = false
-rescan.Text = "RE-DUMP"; rescan.Font = Enum.Font.GothamBold
-rescan.TextSize = 11; rescan.TextColor3 = C.TXT
-rescan.Parent = root; corner(rescan, 6)
-rescan.MouseButton1Click:Connect(function()
-	log(""); log("----- RE-DUMP requested -----")
-	dumpRemotesIn(ReplicatedStorage, "ReplicatedStorage")
-	pcall(function() dumpTools(LocalPlayer:FindFirstChild("Backpack"), "Backpack") end)
-	if LocalPlayer.Character then dumpTools(LocalPlayer.Character, "Character") end
-	flush()
-	rescan.Text = "DUMPED ✓"
-	task.delay(1.5, function() if rescan.Parent then rescan.Text = "RE-DUMP" end end)
-end)
+local hideBtn = Instance.new("TextButton")
+hideBtn.Size = UDim2.new(0.5, -10, 0, 32); hideBtn.Position = UDim2.new(0.5, 2, 0, 220)
+hideBtn.BackgroundColor3 = C.CARD; hideBtn.AutoButtonColor = false
+hideBtn.Text = "HIDE"; hideBtn.Font = Enum.Font.GothamBold
+hideBtn.TextSize = 12; hideBtn.TextColor3 = C.TXT
+hideBtn.Parent = root; corner(hideBtn, 6)
 
--- Update status counter
-task.spawn(function()
-	while true do
-		task.wait(0.4)
-		if status.Parent then
-			status.Text = ("  hook armed · %d fires · %d marks"):format(fireCount, markCount)
-		end
-	end
-end)
-
--- Wrap log() to bump fire counter when a [FIRE] line is added
-local _origLog = log
-function log(line)
-	if typeof(line) == "string" and line:sub(1, 6) == "[FIRE]" then
-		fireCount = fireCount + 1
-	end
-	_origLog(line)
-end
+local hint = Instance.new("TextLabel")
+hint.Size = UDim2.new(1, -16, 0, 26); hint.Position = UDim2.new(0, 8, 0, 258)
+hint.BackgroundTransparency = 1
+hint.Text = "Tap a MARK then do the action.\nMine → AutoOn → wait → AutoOff → Sell."
+hint.Font = Enum.Font.Code; hint.TextSize = 9
+hint.TextColor3 = C.DIM; hint.TextWrapped = true
+hint.TextXAlignment = Enum.TextXAlignment.Left
+hint.Parent = root
 
 -- Drag
 do
@@ -394,9 +551,37 @@ do
 	end)
 end
 
+-- Hide / Show via bubble
+local bubble = Instance.new("TextButton")
+bubble.Size = UDim2.new(0, 50, 0, 50); bubble.Position = UDim2.new(0, 16, 0, 16)
+bubble.BackgroundColor3 = C.PINK; bubble.AutoButtonColor = false
+bubble.Text = "R"; bubble.Font = Enum.Font.GothamBlack
+bubble.TextSize = 18; bubble.TextColor3 = C.TXT
+bubble.Visible = false; bubble.ZIndex = 100; bubble.Parent = gui
+do
+	local c = Instance.new("UICorner") c.CornerRadius = UDim.new(1, 0) c.Parent = bubble
+	local s = Instance.new("UIStroke") s.Color = C.TXT s.Thickness = 2 s.Parent = bubble
+end
+hideBtn.MouseButton1Click:Connect(function()
+	root.Visible = false; bubble.Visible = true
+end)
+bubble.MouseButton1Click:Connect(function()
+	root.Visible = true; bubble.Visible = false
+end)
+
+-- live status
+task.spawn(function()
+	while true do
+		task.wait(0.4)
+		if status.Parent then
+			status.Text = ("  hook on · %d fires · %d marks"):format(fireCount, markCount)
+		end
+	end
+end)
+
 -- ============================================================
 -- READY
 -- ============================================================
-log(("[Recon] Ready. Output → %s"):format(OUT_FILE))
+banner("READY — start tapping markers and performing actions")
 flush()
-print("[MachinaRecon] saving to:", OUT_FILE)
+print("[MachinaReconFull] writing to:", OUT_FILE)
