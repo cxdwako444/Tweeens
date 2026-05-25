@@ -1,21 +1,23 @@
 --!nocheck
 -- ============================================================
--- MACHINA DEBUG v20  —  EXPLODE MODE
+-- MACHINA DEBUG v21  —  EXPLODE CONFIRMED, NOW FARM IT
 -- Branch: claude/rare-indicator-auto-aim-mC8LF
 -- File:   MachinaRecon.txt
 --
--- v19's sniffer caught this when you used an explosive:
---   FireServer("...", "SetMode", "Explode", 9)
+-- PROVEN IN v20: SetMode("Explode", 9) mines 69 blocks in 2s.
+-- BUT: server consumes one explosive from inventory per call.
+-- 1 explosive owned = 1 blast. Need stockpile to chain blasts.
 --
--- This is a 3-arg SetMode variant. The "9" is mystery — could be:
---   - Explosive level (you own level 9 explosive)
---   - Radius in studs
---   - Power/damage
---   - Inventory slot id
---
--- v20 KEEPS the console but front-loads 5 EXPLODE snippets to
--- figure out what works. If we can fire Explode freely, mining
--- becomes a one-shot AOE — exactly what you wanted from the start.
+-- v21 GIVES YOU:
+--   ★ "Burn all explosives" — scans Backpack, fires Explode for
+--     every explosive Tool you own. 20 explosives = ~1400 mines.
+--   ★ "Race-spam Explode 9" — 50 fires in 100ms; if server has a
+--     race between check and consume, multiple may succeed from 1.
+--   ★ "Inspect Explosion frame" — dumps PlayerGui.Game.Frames.Explosion
+--     so we can find the buy/use button code paths.
+--   ★ "Inspect Backpack explosives" — shows your inventory state
+--     including any Charges/Quantity attributes we might be able
+--     to spoof client-side.
 -- ============================================================
 
 local Players          = game:GetService("Players")
@@ -165,82 +167,136 @@ end)
 -- ============================================================
 local SNIPPETS = {
 	{
-		name = "★ Explode 9 (replay capture)",
+		name = "★ Burn all explosives (FARM)",
 		code = [[
--- Replay the EXACT call that fired when you used your explosive.
--- Count blocks mined in the 2s after.
-dprint("Firing SetMode(Explode, 9) — watch for mass-mining")
+-- THE MAIN ATTACK: scan Backpack for every Tool that looks like
+-- an explosive, fire Explode for each one. Buy lots of explosives
+-- in-game first, then tap this. Should chain ~69 mines per blast.
+local bp = LP:FindFirstChild("Backpack")
+if not bp then dprint("no Backpack"); return end
+
+local explosives = {}
+for _, t in ipairs(bp:GetChildren()) do
+  if t:IsA("Tool") then
+    local nm = t.Name:lower()
+    if nm:find("explos") or nm:find("bomb") or nm:find("tnt")
+       or nm:find("dynamite") or nm:find("c4") or nm:find("blast")
+       or nm:find("nuke") then
+      table.insert(explosives, t)
+    end
+  end
+end
+-- Also check character's currently-equipped tool
+local char = LP.Character
+if char then
+  for _, t in ipairs(char:GetChildren()) do
+    if t:IsA("Tool") then
+      local nm = t.Name:lower()
+      if nm:find("explos") or nm:find("bomb") or nm:find("tnt")
+         or nm:find("dynamite") or nm:find("c4") or nm:find("blast") then
+        table.insert(explosives, t)
+      end
+    end
+  end
+end
+
+dprint("Found "..#explosives.." explosive tools:")
+for _, t in ipairs(explosives) do dprint("  - "..t.Name) end
+if #explosives == 0 then
+  dprint("(no explosives — check Backpack inspection snippet to see names)")
+  return
+end
+
 task.spawn(function()
-  local mined = countMinesDuring(2)
-  dprint("RESULT: "..mined.." blocks broke within 40 studs in 2s")
+  local m = countMinesDuring(5)
+  dprint("RESULT: "..m.." blocks mined in 5s across "..#explosives.." blasts")
 end)
-task.wait(0.05)
-R:FireServer(rnonce(), "SetMode", "Explode", 9)
+
+-- Fire one Explode per explosive owned
+for i, t in ipairs(explosives) do
+  R:FireServer(rnonce(), "SetMode", "Explode", 9)
+  dprint("blast #"..i)
+  task.wait(0.3)  -- give server time to consume between blasts
+end
 ]]
 	},
 	{
-		name = "★ Explode levels 1..50",
+		name = "★ Race-spam Explode 9 x50",
 		code = [[
--- Try Explode with different N values. Big N = big boom?
-local levels = {1, 5, 9, 15, 20, 30, 50}
+-- Fire 50 Explode calls in 100ms via parallel coroutines.
+-- If server checks inventory BEFORE consuming with any latency,
+-- multiple blasts might succeed from one explosive (race exploit).
+dprint("Race-spamming 50 Explode calls in 100ms...")
+task.spawn(function()
+  local m = countMinesDuring(4)
+  dprint("RACE RESULT: "..m.." mines")
+end)
+for i = 1, 50 do
+  task.spawn(function() R:FireServer(rnonce(), "SetMode", "Explode", 9) end)
+end
+]]
+	},
+	{
+		name = "★ Inspect Backpack explosives",
+		code = [[
+local bp = LP:FindFirstChild("Backpack")
+if not bp then dprint("no Backpack"); return end
+dprint("=== Backpack contents ===")
+for _, t in ipairs(bp:GetChildren()) do
+  dprint(t.ClassName.." "..t.Name)
+  for k, v in pairs(t:GetAttributes()) do
+    dprint("  @"..k.." = "..tostring(v))
+  end
+  for _, c in ipairs(t:GetChildren()) do
+    if c:IsA("ValueBase") then
+      dprint("  val: "..c.ClassName.." "..c.Name.." = "..tostring(c.Value))
+    end
+  end
+end
+local char = LP.Character
+if char then
+  dprint("=== Currently equipped ===")
+  for _, t in ipairs(char:GetChildren()) do
+    if t:IsA("Tool") then dprint("equipped: "..t.Name) end
+  end
+end
+]]
+	},
+	{
+		name = "★ Inspect Explosion UI frame",
+		code = [[
+local gui = LP.PlayerGui:FindFirstChild("Game")
+if gui then gui = gui:FindFirstChild("Frames") end
+if gui then gui = gui:FindFirstChild("Explosion") end
+if not gui then dprint("no PlayerGui.Game.Frames.Explosion"); return end
+dprint("=== Explosion frame tree ===")
+local function walk(o, d)
+  if d > 5 then return end
+  dprint(string.rep("  ", d) .. o.ClassName .. ":" .. o.Name)
+  if o:IsA("TextButton") or o:IsA("ImageButton") then
+    dprint(string.rep("  ", d) .. "  Text=" .. tostring(o.Text or ""))
+  end
+  for _, c in ipairs(o:GetChildren()) do walk(c, d+1) end
+end
+walk(gui, 0)
+]]
+	},
+	{
+		name = "★ Try Explode N variations with inventory",
+		code = [[
+-- Run AFTER buying multiple explosives. Tests if N matters.
+-- Caveat: each successful blast consumes ONE explosive.
+local levels = {1, 3, 5, 9, 15, 50, 99}
+dprint("Testing Explode N. Each successful = 1 explosive consumed.")
 for _, n in ipairs(levels) do
   dprint("--- Explode "..n.." ---")
   task.spawn(function()
-    local m = countMinesDuring(1.5)
-    dprint("  Explode "..n.." -> "..m.." blocks broke")
+    local m = countMinesDuring(2)
+    dprint("  Explode "..n.." -> "..m.." mines")
   end)
   task.wait(0.05)
   R:FireServer(rnonce(), "SetMode", "Explode", n)
-  task.wait(1.6)
-end
-]]
-	},
-	{
-		name = "★ Spam Explode 9 x20",
-		code = [[
--- Fire Explode 20 times in 4 seconds. Does each call detonate
--- one explosive, or is it just a "mode switch"?
-dprint("Spamming Explode 9 x20...")
-task.spawn(function()
-  local m = countMinesDuring(5)
-  dprint("RESULT: "..m.." blocks mined over 5s")
-end)
-for i = 1, 20 do
-  R:FireServer(rnonce(), "SetMode", "Explode", 9)
-  task.wait(0.2)
-end
-]]
-	},
-	{
-		name = "★ Explode at level 999",
-		code = [[
--- Pure exploit attempt: huge number, might be unclamped server-side
-dprint("Trying Explode 999...")
-task.spawn(function()
-  local m = countMinesDuring(3)
-  dprint("RESULT 999: "..m.." blocks")
-end)
-R:FireServer(rnonce(), "SetMode", "Explode", 999)
-]]
-	},
-	{
-		name = "★ Explode then more args",
-		code = [[
--- Maybe Explode takes more args: position? direction?
-local pos = nearest() or Vector3.new(0,0,0)
-local trials = {
-  {"Explode", 9},
-  {"Explode", 9, pos.X, pos.Y, pos.Z},
-  {"Explode", 9, mineBuf(pos.X, pos.Y, pos.Z, 1)},
-  {"Explode", 9, 1, 2, 3},
-  {"Explode", 0},
-  {"Explode", -1},
-  {"Explode", math.huge},
-}
-for i, t in ipairs(trials) do
-  dprint("trial "..i..": "..dump(t))
-  pcall(function() R:FireServer(rnonce(), "SetMode", table.unpack(t)) end)
-  task.wait(0.5)
+  task.wait(2.1)
 end
 ]]
 	},
@@ -352,11 +408,11 @@ local C = {
 local function corner(o,r) local c=Instance.new("UICorner") c.CornerRadius=UDim.new(0,r or 5) c.Parent=o end
 local function stroke(o,col,t) local s=Instance.new("UIStroke") s.Color=col s.Thickness=t or 1 s.Parent=o end
 
-local old = PlayerGui:FindFirstChild("MachinaDebug20")
+local old = PlayerGui:FindFirstChild("MachinaDebug21")
 if old then old:Destroy() end
 
 local gui = Instance.new("ScreenGui")
-gui.Name = "MachinaDebug20"
+gui.Name = "MachinaDebug21"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -387,7 +443,7 @@ fix.Position=UDim2.new(0,0,1,-8); fix.BackgroundColor3=C.DEEP
 fix.BorderSizePixel=0; fix.Parent=titleBar
 local titleLbl=Instance.new("TextLabel"); titleLbl.Size=UDim2.new(1,-30,1,0)
 titleLbl.Position=UDim2.new(0,7,0,0); titleLbl.BackgroundTransparency=1
-titleLbl.Text="DEBUG v20 — EXPLODE"; titleLbl.Font=Enum.Font.GothamBlack
+titleLbl.Text="DEBUG v21 — BURN EXPLOS"; titleLbl.Font=Enum.Font.GothamBlack
 titleLbl.TextSize=10; titleLbl.TextColor3=C.GOLD
 titleLbl.TextXAlignment=Enum.TextXAlignment.Left; titleLbl.Parent=titleBar
 
@@ -418,7 +474,7 @@ saveBtn.Text="💾 Save output"; saveBtn.Font=Enum.Font.GothamBold; saveBtn.Text
 saveBtn.TextColor3=C.TXT; saveBtn.Parent=root; corner(saveBtn,4)
 saveBtn.MouseButton1Click:Connect(function()
 	if not _writefile then saveBtn.Text="✗"; return end
-	local payload = ("===== MachinaDebug v20 =====\nSaved: %s\n\n%s"):format(
+	local payload = ("===== MachinaDebug v21 =====\nSaved: %s\n\n%s"):format(
 		os.date("%Y-%m-%d %H:%M:%S"), table.concat(OUTPUT, "\n"))
 	local ok = pcall(_writefile, OUT_FILE, payload)
 	saveBtn.Text = ok and ("✓ "..#payload.."b") or "✗"
@@ -562,7 +618,7 @@ end
 local bubble = Instance.new("TextButton")
 bubble.Size=UDim2.new(0,40,0,40); bubble.Position=UDim2.new(0,10,0,10)
 bubble.BackgroundColor3=C.GOLD; bubble.AutoButtonColor=false
-bubble.Text="DBG"; bubble.Font=Enum.Font.GothamBlack
+bubble.Text="D21"; bubble.Font=Enum.Font.GothamBlack
 bubble.TextSize=11; bubble.TextColor3=C.DEEP
 bubble.Visible=false; bubble.ZIndex=10100; bubble.Parent=gui
 do
@@ -585,6 +641,5 @@ task.spawn(function()
 	end
 end)
 
-dprint("v20 ready — found SetMode(Explode, N) in your last sniff")
-dprint("tap '★ Explode 9 (replay capture)' FIRST")
-dprint("watch the RESULT line for how many blocks broke")
+dprint("v21 ready — Explode 9 PROVEN to mine 69 blocks per explosive")
+dprint("buy lots of explosives in-game, then tap '★ Burn all explosives'")
